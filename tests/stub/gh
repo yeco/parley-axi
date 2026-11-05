@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Fake gh for tests. Logs every call to $STUB_LOG and serves files from $STUB_DIR, keyed by repo slug (owner__name):
+#   <slug>.parley.json (contents API), <slug>.labels (one per line), <slug>.issues.json (list), <slug>.issue-<n>.json (view),
+#   <slug>.pr (open init PR url). STUB_NO_AUTH and STUB_GH_FAIL simulate a logged-out gh and a network failure.
+printf '%s\n' "$*" >> "$STUB_LOG"
+[ -z "${STUB_GH_FAIL:-}" ] || { echo "error connecting to api.github.com" >&2; exit 1; }
+repo="" jqf="" path="" fields=()
+args=("$@")
+for ((i = 0; i < $#; i++)); do
+  case ${args[i]} in
+    -R) repo=${args[i + 1]} ;;
+    --jq) jqf=${args[i + 1]} ;;
+    -f) fields+=("${args[i + 1]}") ;;
+    repos/*) path=${args[i]}; repo=$(cut -d/ -f2-3 <<<"$path") ;;
+  esac
+done
+slug=${repo/\//__}
+emit() { if [ -n "$jqf" ]; then jq -r "$jqf"; else cat; fi; }
+field() { local f; for f in ${fields[@]+"${fields[@]}"}; do [[ $f == "$1="* ]] && echo "${f#*=}"; done; }
+case "$1 $2" in
+  "auth token") [ -z "${STUB_NO_AUTH:-}" ] || exit 1; echo tok ;;
+  "api user") echo '{"login":"'"${STUB_LOGIN:-alice-gh}"'"}' | emit ;;
+  api\ *)
+    case $path in
+      */contents/.parley.json)
+        if [[ " $* " == *" -X PUT "* ]]; then
+          field content | base64 -d > "$STUB_DIR/$slug.put.json"
+          echo '{}'
+        elif [ -f "$STUB_DIR/$slug.parley.json" ]; then
+          cat "$STUB_DIR/$slug.parley.json"
+        else
+          echo '{"message":"Not Found","status":"404"}'; echo "gh: Not Found (HTTP 404)" >&2; exit 1
+        fi ;;
+      */git/ref/heads/*) echo '{"object":{"sha":"abc123"}}' | emit ;;
+      */git/refs) echo '{}' ;;
+      repos/*/*) echo '{"default_branch":"main"}' | emit ;;
+      *) echo "stub gh: unhandled api: $*" >&2; exit 2 ;;
+    esac ;;
+  "label list") jq -Rn '[inputs | {name: .}]' "$STUB_DIR/$slug.labels" 2>/dev/null | emit ;;
+  "label create") grep -qxF "$3" "$STUB_DIR/$slug.labels" 2>/dev/null || echo "$3" >> "$STUB_DIR/$slug.labels" ;;
+  "pr list") jq -Rn '[inputs | {url: .}]' "$STUB_DIR/$slug.pr" 2>/dev/null | emit ;;
+  "pr create") echo "https://github.com/$repo/pull/1" | tee "$STUB_DIR/$slug.pr" ;;
+  "issue create") echo "https://github.com/$repo/issues/42" ;;
+  "issue list") emit < "$STUB_DIR/$slug.issues.json" ;;
+  "issue view")
+    f="$STUB_DIR/$slug.issue-$3.json"
+    [ -f "$f" ] || { echo "GraphQL: Could not resolve to an Issue with the number of $3." >&2; exit 1; }
+    emit < "$f" ;;
+  "issue edit"|"issue comment"|"issue close") ;;
+  *) echo "stub gh: unhandled: $*" >&2; exit 2 ;;
+esac

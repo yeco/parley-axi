@@ -1,0 +1,32 @@
+{
+  "name": "parley-axi",
+  "version": "0.1.0",
+  "description": "Agent-ergonomic team messaging over a GitHub repo's issues.",
+  "keywords": [
+    "agent",
+    "axi",
+    "github",
+    "inbox",
+    "messaging",
+    "cli"
+  ],
+  "homepage": "https://github.com/yeco/parley-axi#readme",
+  "bugs": {
+    "url": "https://github.com/yeco/parley-axi/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yeco/parley-axi.git"
+  },
+  "license": "MIT",
+  "author": "yeco",
+  "bin": {
+    "parley-axi": "bin/parley-axi"
+  },
+  "files": [
+    "bin",
+    "checks",
+    "README.md",
+    "LICENSE"
+  ]
+}

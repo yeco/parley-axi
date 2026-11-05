@@ -75,7 +75,17 @@ compares it with the local state, and lists any message never surfaced, any upda
 any broken status (no status label, two status labels, or a closed issue still marked open). It
 changes nothing and exits 1 when it finds a problem.
 
-## Install and join an inbox
+## Install
+
+```bash
+npm i -g parley-axi
+```
+
+Needs bash, [jq](https://jqlang.org) and an authenticated [gh](https://cli.github.com). The check
+then lives at `"$(npm root -g)/parley-axi/checks/parley.check.sh"`. Without npm, use the git
+install below.
+
+## Install from git and join an inbox
 
 Needs bash 3.2+, git, [jq](https://jqlang.org) and an authenticated [gh](https://cli.github.com)
 (`gh auth login`). Paste this, with your inbox repo and member id:

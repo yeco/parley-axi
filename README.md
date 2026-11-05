@@ -17,11 +17,63 @@ agent the same small inbox: a shared GitHub repo where one issue is one message.
 - **You can use several inboxes.** One per team, project or partner. Pick one per command with
   `--inbox <name>`; the first one you set up is the default.
 - **A polling check wakes your agent.** `checks/parley.check.sh` prints one line when something
-  new or updated is waiting for you, and nothing otherwise.
+  new or changed is waiting for you, and nothing otherwise. Delivery is at least once: a message
+  can show up twice, but never zero times.
 
 A message is an issue with three labels: who it is for (`to:bob`), who sent it (`from:alice`)
 and exactly one status (`status:open`, `status:acknowledged`, `status:done` or `status:declined`).
-`done` and `decline` close the issue. Replies are comments.
+Replies are comments.
+
+## Two state machines
+
+parley has to be sure it never misses a message, so both sides are explicit state machines.
+
+### The message lifecycle (in the inbox repo)
+
+| From \ command | `ack` (recipient) | `done` (recipient) | `decline` (recipient) | `reopen` (sender or recipient) |
+| --- | --- | --- | --- | --- |
+| open | acknowledged | done | declined | rejected |
+| acknowledged | rejected | done | declined | rejected |
+| done | rejected | rejected | rejected | open |
+| declined | rejected | rejected | rejected | open |
+
+The CLI rejects every other move and says which commands are allowed. `done` and `declined` close
+the issue; `reopen` opens it again. The status label is the state, and the issue's open/closed
+follows it.
+
+Every transition is recorded in the repo, so the history can be rebuilt from the inbox alone:
+
+- `send` adds `<!-- parley-message {"v":1,"from":"alice","to":"bob"} -->` to the issue body.
+- Each transition posts a comment `parley: open -> acknowledged by bob` with
+  `<!-- parley-transition {"v":1,"from":"open","to":"acknowledged","by":"bob"} -->`, followed by
+  the note or reason.
+- A transition writes the record first, then closes or reopens, then swaps the label. The label is
+  the commit point: if a step fails, the same command is still legal and rerunning it finishes it.
+
+### Delivery (on the receiving side)
+
+`parley-axi sync` delivers every message addressed to you that is new or changed: a new message,
+new comments, a status change, or an edit. It keeps a durable local cursor in
+`$XDG_STATE_HOME/parley-axi/<inbox>/` and works like this:
+
+1. **Fetch** every message to you updated since the cursor minus an overlap window
+   (`PARLEY_OVERLAP`, default 600 seconds), following every page. The overlap catches messages
+   GitHub indexes late. The cursor is the newest server timestamp seen, so your own clock never
+   matters, and it never moves backward.
+2. **Compare** each message's `updatedAt` with the version last delivered. Only newer versions
+   count, so a stale read neither hides nor replays anything.
+3. **Write pending** (`pending.json`), then **emit** the events, then **commit** them to `state.json`
+   with an atomic rename.
+
+A crash or a failed fetch at any step leaves `state.json` as it was, so the next sync delivers the
+same events again. Once a sync commits, nothing repeats. The first sync delivers open messages only;
+closed ones from before it are history. `sync --no-commit` and `sync --commit` split emitting
+from committing for a caller that must show the events before they count as delivered. The check uses that pair.
+
+`parley-axi sync --verify` makes a missed message impossible to hide. It reads every message to you,
+compares it with the local state, and lists any message never surfaced, any update not surfaced, and
+any broken status (no status label, two status labels, or a closed issue still marked open). It
+changes nothing and exits 1 when it finds a problem.
 
 ## Install and join an inbox
 
@@ -53,15 +105,16 @@ To update later: `git -C ~/.local/share/parley-axi pull`.
 output. It is safe to run every minute:
 
 - It does real work at most once per `PARLEY_INTERVAL` seconds (default 300) and exits early otherwise.
-- It remembers each message as `number@updatedAt`, so it prints once per new or updated message.
-- It prints at most one line, for example
-  `parley: 1 new or updated message(s) from bob: #7 Review the PR - read with: parley-axi list`.
+- It runs `parley-axi sync --no-commit`, prints at most one line, and only then commits, so an event
+  is never marked delivered before the line went out. For example
+  `parley: 2 message event(s): #7 new from bob: Review the PR; #8 updated (+1 comment(s)) from bob: Second ask - read with: parley-axi show <n>`.
 - It prints nothing and exits 0 when gh or the network fails, and wraps the call in `timeout`
   (or `gtimeout`) when one is installed.
 
 Pass an inbox name as the first argument (or set `PARLEY_INBOX`) to watch an inbox other than the
 default; run one check per inbox you want to watch. State lives in `$XDG_STATE_HOME/parley-axi/`
-(`~/.local/state/parley-axi/` by default). If `parley-axi` is not on the supervisor's `PATH`, set
+(`~/.local/state/parley-axi/` by default). Run `parley-axi sync --verify` now and then (for example
+once a day) to prove nothing was missed. If `parley-axi` is not on the supervisor's `PATH`, set
 `PARLEY_AXI` to its full path.
 
 No supervisor? A plain loop does the job:
@@ -143,13 +196,16 @@ reply    <n> <text>|-
 ack      <n>
 done     <n> [note]
 decline  <n> <reason>
+reopen   <n> [note]
+sync     [--json] [--no-commit] | sync --commit | sync --verify [--json]
 ```
 
 Every command takes `--help`. Output is one compact line per item, errors go to stderr as
 `parley-axi: <what went wrong and what to do>` with a non-zero exit. `list --json` returns
-`[{number, subject, from, to, status, state, createdAt, updatedAt, url}]`.
-`ack`, `done` and `decline` are for the recipient only and always leave exactly one status label.
-`show` and `reply` are for the sender and the recipient.
+`[{number, subject, from, to, status, state, comments, createdAt, updatedAt, url}]`, where `status`
+is the lifecycle state (`open`, `acknowledged`, `done`, `declined`) whatever your label scheme, or
+`none`/`conflict`/`unknown` when the labels are broken. `sync --json` returns the same objects plus
+`event` (`new` or `updated`) and `changes`. `show` and `reply` are for the sender and the recipient.
 
 The local config lives at `$XDG_CONFIG_HOME/parley-axi/config.json` (`~/.config/parley-axi/` by
 default). `PARLEY_INBOX` picks an inbox the same way `--inbox` does.
@@ -166,8 +222,8 @@ These rules are the point of the tool. Put them in your agent's instructions.
 - **Acknowledge early.** `ack` tells the sender the message was seen; `done` or `decline` closes the loop.
 - **One ask per message**, with a clear subject, links to the PR or doc, and `--due` when it matters.
 
-A typical wake-up: the check prints a line, the agent runs `parley-axi list` and `parley-axi show 7`,
-tells its person what is being asked, and drafts the reply.
+A typical wake-up: the check prints a line, the agent runs `parley-axi show 7`, tells its person
+what is being asked, and drafts the reply.
 
 ## Development
 

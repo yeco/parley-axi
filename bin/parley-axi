@@ -8,6 +8,8 @@ set -euo pipefail
 CONF=${XDG_CONFIG_HOME:-$HOME/.config}/parley-axi/config.json
 CONFIG_FILE=.parley.json
 INIT_BRANCH=parley-init
+STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/parley-axi
+OVERLAP=${PARLEY_OVERLAP:-600}
 
 # Defaults merged under the repo's config; jq's `*` merges nested objects.
 DEFAULTS='{"labels":{"to":"to:","from":"from:","status":"status:",
@@ -42,14 +44,27 @@ EOF
 usage: parley-axi list [--all] [--sent] [--json]
 Default: open messages addressed to you. --sent: messages you sent. --all: include closed ones.
 Lines: #number from:<who> <status> <age> "subject" url   (--sent shows to:<who>)
---json: [{number,subject,from,to,status,state,createdAt,updatedAt,url}]
+--json: [{number,subject,from,to,status,state,comments,createdAt,updatedAt,url}], newest update first.
+status is the lifecycle state (open, acknowledged, done, declined), or none/conflict/unknown when the labels are broken.
 EOF
     ;;
-    show) echo "usage: parley-axi show <n> [--json]   Prints the message and its comments. Sender or recipient only." ;;
+    show) echo "usage: parley-axi show <n> [--json]   Prints the message header, body and comments. Sender or recipient only." ;;
     reply) echo "usage: parley-axi reply <n> <text>|-   Adds a comment. '-' reads the text from stdin. Sender or recipient only." ;;
-    ack) echo "usage: parley-axi ack <n>   Recipient only. Sets the acknowledged status." ;;
-    done) echo "usage: parley-axi done <n> [note]   Recipient only. Sets the done status, comments the note, closes the issue." ;;
-    decline) echo "usage: parley-axi decline <n> <reason>   Recipient only. Sets the declined status, comments the reason, closes the issue." ;;
+    ack) echo "usage: parley-axi ack <n>   Recipient only. open -> acknowledged." ;;
+    done) echo "usage: parley-axi done <n> [note]   Recipient only. open|acknowledged -> done, closes the issue." ;;
+    decline) echo "usage: parley-axi decline <n> <reason>   Recipient only. open|acknowledged -> declined, closes the issue." ;;
+    reopen) echo "usage: parley-axi reopen <n> [note]   Sender or recipient. done|declined -> open, reopens the issue." ;;
+    sync) cat <<'EOT'
+usage: parley-axi sync [--json] [--no-commit] | sync --commit | sync --verify [--json]
+Delivers every message to you that is new or changed since the last sync (new message, new comments,
+status change, edit), at least once. One line per event, or --json: [{...message, event, changes}].
+--no-commit prints the events but keeps them pending; sync --commit marks them delivered. Use the pair
+when something else has to show the events first, so a crash in between delivers them again.
+--verify compares the local delivery state with the repo and lists any message never surfaced and any
+broken status; it changes nothing and exits 1 when it finds a problem.
+env: PARLEY_OVERLAP (seconds re-read before the cursor, default 600), XDG_STATE_HOME (state in $XDG_STATE_HOME/parley-axi/)
+EOT
+    ;;
     *) cat <<'EOF'
 usage: parley-axi [--inbox <name>] [--as <member-id>] <command> [args]
 commands:
@@ -63,6 +78,8 @@ commands:
   ack       acknowledge a message sent to you
   done      mark a message done and close it
   decline   decline a message and close it
+  reopen    reopen a done or declined message
+  sync      deliver new and changed messages, at least once (--verify to reconcile)
 Every command takes --help. --inbox and --as also work after the command.
 env: PARLEY_INBOX (inbox name), XDG_CONFIG_HOME (local config at $XDG_CONFIG_HOME/parley-axi/config.json)
 EOF
@@ -84,7 +101,7 @@ parse() {
         [[ $allowed == *" $1 "* ]] || die "$cmd: unknown option '$1' (see parley-axi $cmd --help)"
         opt=${1#--}
         case $1 in
-          --json|--all|--sent|--direct|--default) printf -v "F_$opt" 1; shift; continue ;;
+          --json|--all|--sent|--direct|--default|--verify|--no-commit|--commit) printf -v "F_${opt//-/_}" 1; shift; continue ;;
         esac
         [ $# -ge 2 ] || die "$cmd: $1 needs a value"
         case $1 in
@@ -99,7 +116,7 @@ parse() {
   done
 }
 F_inbox="" F_as="" F_repo="" F_name="" F_to="" F_subject="" F_body="" F_body_file="" F_due=""
-F_json="" F_all="" F_sent="" F_direct="" F_default=""
+F_json="" F_all="" F_sent="" F_direct="" F_default="" F_verify="" F_no_commit="" F_commit=""
 F_link=() F_member=()
 
 require_gh() {
@@ -160,6 +177,7 @@ resolve() {
   is_member "$ME" || die "'$ME' is not a member of $REPO (members: $(member_ids))"
 }
 
+
 # load <n>: sets STATE and LABELS (one per line) and checks it is a parley message.
 load() {
   [[ $1 =~ ^[0-9]+$ ]] || die "message number must be numeric, got '$1'"
@@ -189,18 +207,53 @@ need_party() {
 
 need_recipient() {
   [ "$(label_val "$P_TO")" = "$ME" ] || die "#$1 is addressed to $(label_val "$P_TO"), not to you ($ME)"
-  [ "$STATE" = OPEN ] || die "#$1 is already closed"
 }
 
-# set_status <n> <status value>: leaves exactly one status label on the issue.
-set_status() {
-  local args=(--add-label "$P_ST$2") l
+status_label() {
+  case $1 in open) echo "$P_ST$S_OPEN" ;; acknowledged) echo "$P_ST$S_ACK" ;; done) echo "$P_ST$S_DONE" ;; declined) echo "$P_ST$S_DECL" ;; esac
+}
+
+# cur_status <n>: the message's lifecycle state. The single status label is the state; open/closed follows it.
+cur_status() {
+  local l vals=()
   while IFS= read -r l; do
-    if [[ $l == "$P_ST"* && $l != "$P_ST$2" ]]; then args+=(--remove-label "$l"); fi
+    if [[ $l == "$P_ST"* ]]; then vals+=("${l#"$P_ST"}"); fi
+  done <<<"$LABELS"
+  [ ${#vals[@]} -eq 1 ] || die "#$1 has ${#vals[@]} status labels: fix them by hand so exactly one remains (see parley-axi sync --verify)"
+  case ${vals[0]} in
+    "$S_OPEN") echo open ;; "$S_ACK") echo acknowledged ;; "$S_DONE") echo "done" ;; "$S_DECL") echo declined ;;
+    *) die "#$1 has unknown status label '$P_ST${vals[0]}'" ;;
+  esac
+}
+
+# set_status <n> <label>: leaves exactly one status label on the issue.
+set_status() {
+  local args=(--add-label "$2") l
+  while IFS= read -r l; do
+    if [[ $l == "$P_ST"* && $l != "$2" ]]; then args+=(--remove-label "$l"); fi
   done <<<"$LABELS"
   gh issue edit "$1" -R "$REPO" "${args[@]}" >/dev/null
 }
 
+# JQ_NORM: turns a REST issue into a message. status is the lifecycle state, or none/conflict/unknown when the labels are broken.
+# shellcheck disable=SC2016 # jq variables
+JQ_NORM='def lab($p): [.labels[] | select(startswith($p)) | ltrimstr($p)];
+  def norm($l): ($l.statuses | to_entries | map({key: .value, value: .key}) | from_entries) as $roles |
+    {number, subject: .title, from: (lab($l.from) | first), to: (lab($l.to) | first),
+     status: (lab($l.status) | if length == 1 then ($roles[.[0]] // "unknown") elif length == 0 then "none" else "conflict" end),
+     state, comments, createdAt: .created_at, updatedAt: .updated_at, url: .html_url};'
+
+# fetch_issues <label> <open|closed|all> [since]: every matching message, all pages, oldest update first, as one JSON array.
+fetch_issues() {
+  local q
+  q="labels=$(jq -rn --arg l "$1" '$l | @uri')&state=$2&sort=updated&direction=asc&per_page=100${3:+&since=$3}"
+  gh api --paginate "repos/$REPO/issues?$q" \
+    --jq '.[] | select(.pull_request == null) | {number, title, state, comments, created_at, updated_at, html_url, labels: [.labels[].name]}' |
+    jq -cs --argjson l "$(jq -c .labels <<<"$CFG")" "$JQ_NORM map(norm(\$l))"
+}
+
+# crashpoint <step>: test hook that simulates a crash right before <step>.
+crashpoint() { [ "${PARLEY_CRASH_AT:-}" != "$1" ] || exit 70; }
 cmd_init() {
   parse init "--repo --member --direct" "$@"
   [ ${#POS[@]} -eq 0 ] && [ -n "$F_repo" ] || die "usage: parley-axi init --repo <owner/name> (see --help)"
@@ -285,7 +338,6 @@ cmd_send() {
   resolve
   [ -n "$F_to" ] || die "send: --to is required (members: $(member_ids))"
   is_member "$F_to" || die "send: '$F_to' is not a member of $REPO (members: $(member_ids))"
-  [ "$F_to" != "$ME" ] || die "send: --to is you ($ME)"
   [ -n "$F_subject" ] || die "send: --subject is required"
   if [ -n "$F_body_file" ]; then
     [ -z "$body" ] || die "send: use --body or --body-file, not both"
@@ -304,10 +356,11 @@ cmd_send() {
   if [ -n "$body" ]; then parts+=("$body"); fi
   if [ ${#F_link[@]} -gt 0 ]; then parts+=("Links:"$'\n'"$(printf -- '- %s\n' "${F_link[@]}")"); fi
   if [ -n "$F_due" ]; then parts+=("Due: $F_due"); fi
-  for p in ${parts[@]+"${parts[@]}"}; do msg+="${msg:+$'\n\n'}$p"; done
+  parts+=("<!-- parley-message {\"v\":1,\"from\":\"$ME\",\"to\":\"$F_to\"} -->")
+  for p in "${parts[@]}"; do msg+="${msg:+$'\n\n'}$p"; done
 
   url=$(gh issue create -R "$REPO" --title "$F_subject" --body "$msg" \
-    --label "$P_TO$F_to" --label "$P_FROM$ME" --label "$P_ST$S_OPEN")
+    --label "$P_TO$F_to" --label "$P_FROM$ME" --label "$(status_label open)")
   if [ -n "$F_json" ]; then
     jq -nc --argjson n "${url##*/}" --arg u "$url" --arg t "$F_to" '{number: $n, to: $t, url: $u}'
   else
@@ -322,16 +375,12 @@ cmd_list() {
   local state=open mine=$P_TO show=from out
   if [ -n "$F_all" ]; then state=all; fi
   if [ -n "$F_sent" ]; then mine=$P_FROM show=to; fi
-  out=$(gh issue list -R "$REPO" --state "$state" --label "$mine$ME" --limit 100 \
-    --json number,title,state,labels,createdAt,updatedAt,url |
-    jq --arg to "$P_TO" --arg from "$P_FROM" --arg st "$P_ST" '
-      def lab($p): [.labels[].name | select(startswith($p)) | ltrimstr($p)] | first // null;
-      [.[] | {number, subject: .title, from: lab($from), to: lab($to), status: lab($st), state, createdAt, updatedAt, url}]')
+  out=$(fetch_issues "$mine$ME" "$state" | jq -c reverse) || die "gh failed listing messages in $REPO"
   if [ -n "$F_json" ]; then echo "$out"; return; fi
   out=$(jq -r --arg show "$show" '
     def age: if . < 60 then "\(.)s" elif . < 3600 then "\(./60|floor)m"
              elif . < 86400 then "\(./3600|floor)h" else "\(./86400|floor)d" end;
-    .[] | "#\(.number) \($show):\(.[$show] // "-") \(.status // "-") \((now - (.createdAt | fromdateiso8601)) | floor | age) \"\(.subject)\" \(.url)"' <<<"$out")
+    .[] | "#\(.number) \($show):\(.[$show] // "-") \(.status) \((now - (.createdAt | fromdateiso8601)) | floor | age) \"\(.subject)\" \(.url)"' <<<"$out")
   echo "${out:-no messages}"
 }
 
@@ -341,11 +390,17 @@ cmd_show() {
   resolve
   load "${POS[0]}"
   need_party "${POS[0]}"
-  if [ -n "$F_json" ]; then
-    gh issue view "${POS[0]}" -R "$REPO" --json number,title,body,state,labels,author,comments,createdAt,updatedAt,url
-  else
-    gh issue view "${POS[0]}" -R "$REPO" --comments
-  fi
+  local out
+  out=$(gh issue view "${POS[0]}" -R "$REPO" --json number,title,body,state,labels,author,comments,createdAt,updatedAt,url)
+  if [ -n "$F_json" ]; then echo "$out"; return; fi
+  # Rendered here because gh's non-TTY --comments output drops the body.
+  jq -r --arg to "$P_TO" --arg from "$P_FROM" --arg st "$P_ST" '
+    def lab($p): [.labels[].name | select(startswith($p)) | ltrimstr($p)] | first // "-";
+    def text: split("\n") | map(select(startswith("<!-- parley-") | not)) | join("\n") | sub("\\s+$"; "");
+    "#\(.number) \(.title)",
+    "from:\(lab($from)) to:\(lab($to)) status:\(lab($st)) \(.state | ascii_downcase) \(.createdAt) \(.url)",
+    "", (.body | text | select(. != "")),
+    (.comments[] | "", "--- \(.author.login) \(.createdAt)", (.body | text))' <<<"$out"
 }
 
 cmd_reply() {
@@ -361,40 +416,129 @@ cmd_reply() {
   echo "replied on #$n"
 }
 
-# finish <ack|done|decline> <closing comment or empty>: ack leaves the issue open, done/decline close it.
-finish() {
-  local note=$2 n=${POS[0]} status
+# transition <ack|done|decline|reopen> <note>: one step of the message state machine (see README).
+# Writes in this order: the record comment, close/reopen, then the status label. The label is the
+# commit point, so after a failure the same command is still legal and rerunning it finishes the step.
+transition() {
+  local cmd=$1 note=$2 n=${POS[0]} cur next body out
   resolve
-  case $1 in ack) status=$S_ACK ;; done) status=$S_DONE ;; decline) status=$S_DECL ;; esac
   load "$n"
-  need_recipient "$n"
-  set_status "$n" "$status"
-  if [ "$1" != ack ]; then
-    if [ -n "$note" ]; then
-      gh issue close "$n" -R "$REPO" --comment "$note" >/dev/null
-    else
-      gh issue close "$n" -R "$REPO" >/dev/null
-    fi
-  fi
-  echo "#$n $status"
+  if [ "$cmd" = reopen ]; then need_party "$n"; else need_recipient "$n"; fi
+  cur=$(cur_status "$n")
+  case $cmd:$cur in
+    ack:open) next=acknowledged ;;
+    done:open|done:acknowledged) next="done" ;;
+    decline:open|decline:acknowledged) next=declined ;;
+    reopen:done|reopen:declined) next=open ;;
+    *) case $cur in open) out="ack, done or decline" ;; acknowledged) out="done or decline" ;; *) out=reopen ;; esac
+       die "$cmd: #$n is $cur; from $cur the allowed commands are $out" ;;
+  esac
+  body="parley: $cur -> $next by $ME"$'\n'"<!-- parley-transition {\"v\":1,\"from\":\"$cur\",\"to\":\"$next\",\"by\":\"$ME\"} -->"
+  if [ -n "$note" ]; then body+=$'\n\n'"$note"; fi
+  gh issue comment "$n" -R "$REPO" --body "$body" >/dev/null
+  # gh prints its own success line on stderr, so keep stderr only when the call fails
+  case $next:$STATE in
+    done:OPEN|declined:OPEN) out=$(gh issue close "$n" -R "$REPO" 2>&1) || die "gh failed closing #$n: $out" ;;
+    open:CLOSED) out=$(gh issue reopen "$n" -R "$REPO" 2>&1) || die "gh failed reopening #$n: $out" ;;
+  esac
+  set_status "$n" "$(status_label "$next")"
+  echo "#$n $cur -> $next"
 }
 
 cmd_ack() {
   parse ack "" "$@"
   [ ${#POS[@]} -eq 1 ] || die "usage: parley-axi ack <n>"
-  finish ack ""
+  transition ack ""
 }
 
 cmd_done() {
   parse "done" "" "$@"
   [ ${#POS[@]} -ge 1 ] || die "usage: parley-axi done <n> [note]"
-  finish "done" "${POS[*]:1}"
+  transition "done" "${POS[*]:1}"
 }
 
 cmd_decline() {
   parse decline "" "$@"
   [ ${#POS[@]} -ge 2 ] || die "usage: parley-axi decline <n> <reason>"
-  finish decline "Declined: ${POS[*]:1}"
+  transition decline "${POS[*]:1}"
+}
+
+cmd_reopen() {
+  parse reopen "" "$@"
+  [ ${#POS[@]} -ge 1 ] || die "usage: parley-axi reopen <n> [note]"
+  transition reopen "${POS[*]:1}"
+}
+
+# Delivery state per inbox, in $STATE_DIR/<inbox>/:
+#   state.json    {cursor, versions: {"<n>": {updatedAt, comments, status, state}}}, the last committed delivery
+#   pending.json  the next state.json plus the events it delivers, written before any event is printed
+# A sync fetches every message updated since cursor minus PARLEY_OVERLAP, prints what changed, and only then
+# commits. A crash at any step leaves state.json as it was, so the events come again (at least once).
+commit_pending() {
+  [ -f "$1/pending.json" ] || return 0
+  jq -c 'del(.events)' "$1/pending.json" > "$1/state.json.tmp"
+  crashpoint swap
+  mv "$1/state.json.tmp" "$1/state.json"
+  rm -f "$1/pending.json"
+}
+
+cmd_sync() {
+  parse sync "--verify --no-commit --commit --json" "$@"
+  [ ${#POS[@]} -eq 0 ] || die "sync: unexpected argument '${POS[0]}' (see parley-axi sync --help)"
+  resolve
+  local dir="$STATE_DIR/$INBOX" since issues out
+  mkdir -p "$dir"
+  [ -f "$dir/state.json" ] || echo '{}' > "$dir/state.json"
+  if [ -n "$F_commit" ]; then commit_pending "$dir"; return; fi
+  if [ -n "$F_verify" ]; then verify "$dir"; return; fi
+
+  since=$(jq -r --argjson o "$OVERLAP" '.cursor // empty | fromdateiso8601 - $o | todateiso8601' "$dir/state.json")
+  issues=$(fetch_issues "$P_TO$ME" all "$since") || die "gh failed fetching messages from $REPO"
+  crashpoint write-pending
+  # A version only moves forward, so a stale read never hides or replays an update. The first sync
+  # delivers open messages only; closed ones before it are history, not news.
+  jq -c --slurpfile s "$dir/state.json" '
+    $s[0] as $old | ($old.versions // {}) as $v | . as $all |
+    {cursor: ([$old.cursor // empty, $all[].updatedAt] | max),
+     versions: (reduce $all[] as $i ($v; ($i.number | tostring) as $k |
+       if .[$k] == null or $i.updatedAt > .[$k].updatedAt then .[$k] = ($i | {updatedAt, comments, status, state}) else . end)),
+     events: [$all[] | . as $i | $v[.number | tostring] as $o |
+       select(if $o == null then ($old.cursor != null or .state == "open") else .updatedAt > $o.updatedAt end) |
+       . + {event: (if $o == null then "new" else "updated" end),
+            changes: (if $o == null then [] else
+              [(if .comments > $o.comments then "+\(.comments - $o.comments) comment(s)" else empty end),
+               (if .status != $o.status then "\($o.status) -> \(.status)" else empty end),
+               (if .state != $o.state then .state else empty end)] | if length == 0 then ["edited"] else . end end)}]}' \
+    <<<"$issues" > "$dir/pending.json.tmp"
+  mv "$dir/pending.json.tmp" "$dir/pending.json"
+  crashpoint emit
+  if [ -n "$F_json" ]; then
+    jq -c .events "$dir/pending.json"
+  else
+    out=$(jq -r '.events[] | "#\(.number) \(.event)\(if (.changes | length) > 0 then " (" + (.changes | join(", ")) + ")" else "" end) from:\(.from // "-") \(.status) \"\(.subject)\" \(.url)"' "$dir/pending.json")
+    echo "${out:-no new messages}"
+  fi
+  crashpoint commit
+  if [ -z "$F_no_commit" ]; then commit_pending "$dir"; fi
+}
+
+# verify <dir>: reconciles the local delivery state with every message to you in the repo. Read-only.
+verify() {
+  local issues out
+  issues=$(fetch_issues "$P_TO$ME" all) || die "gh failed fetching messages from $REPO"
+  out=$(jq -c --slurpfile s "$1/state.json" '($s[0].versions // {}) as $v | {messages: length, problems: [.[] |
+    $v[.number | tostring] as $o |
+    (if $o == null then "#\(.number) never surfaced: \(.status) \"\(.subject)\" \(.url)"
+     elif .updatedAt > $o.updatedAt then "#\(.number) update not surfaced: delivered \($o.updatedAt), now \(.updatedAt) \(.url)"
+     else empty end),
+    (if (.status | IN("none", "conflict", "unknown")) then "#\(.number) status labels broken (\(.status)) \(.url)"
+     elif (.status | IN("open", "acknowledged")) != (.state == "open") then "#\(.number) is \(.status) but the issue is \(.state) \(.url)"
+     else empty end)]}' <<<"$issues")
+  if [ -n "$F_json" ]; then echo "$out"; else
+    jq -r '.problems[], if (.problems | length) == 0 then "verify: \(.messages) message(s), all surfaced, states consistent"
+      else "verify: \(.problems | length) problem(s) in \(.messages) message(s) (run parley-axi sync to deliver)" end' <<<"$out"
+  fi
+  [ "$(jq '.problems | length' <<<"$out")" = 0 ]
 }
 
 while [ $# -gt 0 ]; do
@@ -407,6 +551,6 @@ done
 [ $# -gt 0 ] || { help_for main; exit 0; }
 cmd=$1; shift
 case $cmd in
-  init|setup|inboxes|send|list|show|reply|ack|done|decline) "cmd_$cmd" "$@" ;;
+  init|setup|inboxes|send|list|show|reply|ack|done|decline|reopen|sync) "cmd_$cmd" "$@" ;;
   *) die "unknown command '$cmd' (see parley-axi --help)" ;;
 esac

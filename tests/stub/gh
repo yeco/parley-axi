@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Fake gh for tests. Logs every call to $STUB_LOG and serves files from $STUB_DIR, keyed by repo slug (owner__name):
-#   <slug>.parley.json (contents API), <slug>.labels (one per line), <slug>.issues.json (list), <slug>.issue-<n>.json (view),
-#   <slug>.pr (open init PR url). STUB_NO_AUTH and STUB_GH_FAIL simulate a logged-out gh and a network failure.
+#   <slug>.parley.json (contents API), <slug>.labels (one per line), <slug>.pr (open init PR url),
+#   <slug>.issues.json (REST issues: filtered by labels, state and since, in pages of 100; only the first without --paginate), <slug>.issue-<n>.json (view).
+# STUB_NO_AUTH and STUB_GH_FAIL simulate a logged-out gh and a network failure.
 printf '%s\n' "$*" >> "$STUB_LOG"
 [ -z "${STUB_GH_FAIL:-}" ] || { echo "error connecting to api.github.com" >&2; exit 1; }
 repo="" jqf="" path="" fields=()
@@ -31,6 +32,17 @@ case "$1 $2" in
         else
           echo '{"message":"Not Found","status":"404"}'; echo "gh: Not Found (HTTP 404)" >&2; exit 1
         fi ;;
+      */issues\?*)
+        q=${path#*\?} label="" state="" since=""
+        IFS='&' read -ra kv <<<"$q"
+        for p in "${kv[@]}"; do
+          v=${p#*=}; v=$(printf '%b' "${v//%/\\x}")
+          case $p in labels=*) label=$v ;; state=*) state=$v ;; since=*) since=$v ;; esac
+        done
+        jq -c --arg l "$label" --arg s "$state" --arg t "$since" '
+          map(select(any(.labels[]; .name == $l) and ($s == "all" or .state == $s) and ($t == "" or .updated_at >= $t)))
+          | sort_by(.updated_at) | if length == 0 then [] else range(0; length; 100) as $i | .[$i:$i + 100] end' \
+          "$STUB_DIR/$slug.issues.json" | if [[ " $* " == *" --paginate "* ]]; then cat; else head -n 1; fi | emit ;;
       */git/ref/heads/*) echo '{"object":{"sha":"abc123"}}' | emit ;;
       */git/refs) echo '{}' ;;
       repos/*/*) echo '{"default_branch":"main"}' | emit ;;
@@ -41,11 +53,10 @@ case "$1 $2" in
   "pr list") jq -Rn '[inputs | {url: .}]' "$STUB_DIR/$slug.pr" 2>/dev/null | emit ;;
   "pr create") echo "https://github.com/$repo/pull/1" | tee "$STUB_DIR/$slug.pr" ;;
   "issue create") echo "https://github.com/$repo/issues/42" ;;
-  "issue list") emit < "$STUB_DIR/$slug.issues.json" ;;
   "issue view")
     f="$STUB_DIR/$slug.issue-$3.json"
     [ -f "$f" ] || { echo "GraphQL: Could not resolve to an Issue with the number of $3." >&2; exit 1; }
     emit < "$f" ;;
-  "issue edit"|"issue comment"|"issue close") ;;
+  "issue edit"|"issue comment"|"issue close"|"issue reopen") ;;
   *) echo "stub gh: unhandled: $*" >&2; exit 2 ;;
 esac

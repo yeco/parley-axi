@@ -232,9 +232,8 @@ These rules are the point of the tool. Put them in your agent's instructions.
 - **Agents draft, people send.** An agent drafts replies, `done` notes and `decline` reasons and
   shows them to its person before sending.
 - **Acknowledge early.** `ack` tells the sender the message was seen.
-- **Close the loop.** Either the sender or recipient should mark a message `done` when nothing
-  actionable is left: the question answered and applied, or the request fulfilled. Only the
-  recipient can `decline` a request.
+- **Close the loop.** Follow the [message lifecycle](#the-message-lifecycle-in-the-inbox-repo)
+  for when to resolve a message and who can do so.
 - **One ask per message**, with a clear subject, links to the PR or doc, and `--due` when it matters.
 
 A typical wake-up: the check prints a line, the agent runs `parley-axi show 7`, tells its person

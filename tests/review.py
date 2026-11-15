@@ -1,7 +1,8 @@
 """CLI regressions: unread ownership and scheduler safety from the agreed design.
 
-The independent oracle is the author's unread/scheduling contract. These cases
-reject writer-dependent delivery, self-wakes, lost post-print activity, cron
+The independent oracle is the author's narrowed unread/scheduling contract. These cases
+reject edit-only notifications, unretried older read labels, writer-dependent delivery,
+self-wakes, lost post-print activity, cron
 replacement on read failure, and cadence-only checks with a wrong executable.
 """
 from datetime import datetime, timedelta
@@ -111,16 +112,17 @@ with tempfile.TemporaryDirectory(prefix="parley-review-") as tmp:
             call("show", "1")
             mutate(lambda d: (d["comments"][0].update(body="Edited through GitHub"),
                               d["comments"][0]["edits"].append({"id": "comment-edit", "editor": {"login": "bob-gh"}})))
-            assert unread() == [1]
-            call("show", "1")
+            assert unread() == []
             mutate(lambda d: (d.update(body="Edited body"),
                               d["edits"].append({"id": "body-edit", "editor": {"login": "bob-gh"}})))
-            assert unread() == [1]
-            call("show", "1")
             assert unread() == []
-    print("ok GitHub comments and edits on incoming/sent, open/closed threads")
+            mutate(lambda d: (d.update(title="Edited title"), d["timeline"].append({
+                "id": "rename", "__typename": "RenamedTitleEvent", "actor": {"login": "bob-gh"}})))
+            assert unread() == []
+            assert "Edited title" in call("show", "1")
+    print("ok new GitHub comments trigger unread; comment/body/title edits do not, on incoming/sent and open/closed threads")
 
-    for event in ("RenamedTitleEvent", "ClosedEvent", "ReopenedEvent", "LabeledEvent", "UnlabeledEvent"):
+    for event in ("ClosedEvent", "ReopenedEvent", "LabeledEvent", "UnlabeledEvent"):
         fixture()
         call("show", "1")
         mutate(lambda d: d["timeline"].append({"id": event, "__typename": event,
@@ -134,7 +136,7 @@ with tempfile.TemporaryDirectory(prefix="parley-review-") as tmp:
     mutate(lambda d: d["timeline"].append({"id": "projection", "__typename": "LabeledEvent",
                                           "actor": {"login": "bob-gh"}, "label": {"name": "unread:bob"}}))
     assert unread() == []
-    print("ok title/lifecycle/status activity; unread projection does not self-wake")
+    print("ok lifecycle/status activity; unread projection does not self-wake")
 
     for command, state, status, member in (("ack", "OPEN", "open", "alice"),
                                             ("done", "OPEN", "open", "bob"),
@@ -209,6 +211,42 @@ with tempfile.TemporaryDirectory(prefix="parley-review-") as tmp:
     assert not any(line.startswith("api graphql") for line in Path(env["STUB_LOG"]).read_text().splitlines())
     print("ok receipts control cached unread despite failed projection; sync retries publication without history scans")
 
+    for mode in ((), ("--json",)):
+        fixture()
+        call("sync", "--json")
+        older = json.loads(file.read_text())
+        newer = {**older, "id": "newer-thread", "number": 2, "title": "Newer request", "url": "https://x/2",
+                 "createdAt": "2026-11-05T12:00:00Z", "updatedAt": "2026-11-05T12:00:00Z",
+                 "labels": [label for label in older["labels"] if not label["name"].startswith("unread:")]}
+        (stub / "acme__team.issue-2.json").write_text(json.dumps(newer))
+        listing = json.loads((stub / "acme__team.issues.json").read_text())
+        listing.append({"number": 2, "title": newer["title"], "body": newer["body"], "state": "open",
+                        "comments": 0, "labels": newer["labels"], "created_at": newer["createdAt"],
+                        "updated_at": newer["updatedAt"], "html_url": newer["url"]})
+        (stub / "acme__team.issues.json").write_text(json.dumps(listing))
+        call("sync", "--json")
+        call("show", "2")
+        for name in ("activity", "state"):
+            state = json.loads((tmp / f"state/parley-axi/team/alice/acme:team/{name}.json").read_text())
+            assert state["cursor"] == "2026-11-05T12:00:00Z"
+        call("show", "1", *mode, extra={"STUB_EDIT_FAIL": "1"}, ok=False)
+        assert json.loads(call("list", "--unread", "--json")) == []
+        assert "unread:alice" in [label["name"] for label in json.loads(file.read_text())["labels"]]
+        Path(env["STUB_LOG"]).write_text("")
+        assert json.loads(call("sync", "--json")) == []
+        assert "unread:alice" not in [label["name"] for label in json.loads(file.read_text())["labels"]]
+        cache = json.loads((tmp / "state/parley-axi/team/alice/acme:team/activity.json").read_text())
+        assert "alice" not in cache["versions"]["1"]["message"]["unread"]
+        requests = Path(env["STUB_LOG"]).read_text().splitlines()
+        assert sum(line.startswith("api --paginate repos/acme/team/issues?") for line in requests) == 1
+        assert not any(line.startswith("api graphql") or line.startswith("issue view") for line in requests)
+        Path(env["STUB_LOG"]).write_text("")
+        call("sync", "--json")
+        assert not any(line.startswith("issue edit") or line.startswith("api graphql")
+                       for line in Path(env["STUB_LOG"]).read_text().splitlines())
+    (stub / "acme__team.issue-2.json").unlink()
+    print("ok successful sync retries older cached read-label failures outside overlap once, without history scans")
+
     fixture()
     call("sync", "--json")
     call("show", "1")
@@ -241,7 +279,7 @@ with tempfile.TemporaryDirectory(prefix="parley-review-") as tmp:
                 data["labels"].append({"name": "status:acknowledged"})
                 data["timeline"].append({**event, "__typename": "LabeledEvent", "label": {"name": "status:acknowledged"}})
         mutate(edit, advance=False)
-        assert unread() == [1], field
+        assert unread() == ([] if field in ("title", "body") else [1]), field
         call("show", "1")
         assert unread() == []
     print("ok same-second comments, title/body edits, state/status changes and delivery verification")
@@ -280,8 +318,9 @@ with tempfile.TemporaryDirectory(prefix="parley-review-") as tmp:
     shown = json.loads(call("show", "1", "--json"))
     assert shown["body"] == unicode_body and shown["comments"][0]["body"] == unicode_body
     assert unread() == []
-    mutate(lambda d: d["edits"].extend([
-        {"id": f"edit-{i}-" + "e" * 64, "editor": {"login": "bob-gh"}} for i in range(2_000)
+    mutate(lambda d: d["comments"].extend([
+        {"id": f"comment-{i}-" + "c" * 64, "body": "New comment", "author": {"login": "bob-gh"},
+         "createdAt": "2026-11-05T12:00:00Z"} for i in range(2_000)
     ]))
     assert unread() == [1]
     call("show", "1", "--json")
@@ -342,6 +381,38 @@ with tempfile.TemporaryDirectory(prefix="parley-review-") as tmp:
                             text=True, capture_output=True, check=True)
     assert "1 unread message(s): #1 unread from bob: Review request" in result.stdout
     call("schedule", "remove", extra={"STUB_SYSTEMCTL": "1"})
+    fixture()
+    call("sync", "--json")
+    call("show", "1")
+    for field in ("title", "body", "comment"):
+        if field == "comment":
+            mutate(lambda d: d["comments"].append({"id": "editable-comment", "body": "Original comment",
+                   "createdAt": "2026-11-05T12:00:00Z", "author": {"login": "bob-gh"}, "edits": []}))
+            call("sync", "--json")
+            call("show", "1")
+        def edit_only(data):
+            if field == "title":
+                data["title"] = "Edited request"
+                data["timeline"].append({"id": "edited-title", "__typename": "RenamedTitleEvent", "actor": {"login": "bob-gh"}})
+            elif field == "body":
+                data["body"] = "Edited existing body"
+                data["edits"].append({"id": "edited-body", "editor": {"login": "bob-gh"}})
+            else:
+                data["comments"][0]["body"] = "Edited existing comment"
+                data["comments"][0]["edits"].append({"id": "edited-comment", "editor": {"login": "bob-gh"}})
+        mutate(edit_only)
+        events = json.loads(call("sync", "--json"))
+        assert [(item["number"], item["event"], item["changes"]) for item in events] == [(1, "updated", ["edited"])]
+        assert json.loads(call("list", "--unread", "--json")) == []
+        call("schedule", "install", "--every", "5m", "--notify", f"cat > '{notification}'", extra={"STUB_SYSTEMCTL": "1"})
+        notification.unlink(missing_ok=True)
+        assert call("schedule", "tick") == ""
+        assert not notification.exists()
+        result = subprocess.run(["bash", str(ROOT / "checks/parley.check.sh")], env=env,
+                                text=True, capture_output=True, check=True)
+        assert result.stdout == ""
+        call("schedule", "remove", extra={"STUB_SYSTEMCTL": "1"})
+    print("ok edits remain sync delivery events but produce no unread listing, heartbeat or check notification")
     print("ok heartbeat stdin, silent read tick, and check share unread computation")
 
     fixture()

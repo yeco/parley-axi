@@ -4,6 +4,7 @@ The independent oracle is the author's unread/scheduling contract. These cases
 reject writer-dependent delivery, self-wakes, lost post-print activity, cron
 replacement on read failure, and cadence-only checks with a wrong executable.
 """
+from datetime import datetime, timedelta
 import json
 import os
 from pathlib import Path
@@ -27,7 +28,7 @@ with tempfile.TemporaryDirectory(prefix="parley-review-") as tmp:
         "PARLEY_INTERVAL": "0",
     }
     for key in ("PARLEY_INBOX", "PARLEY_CRASH_AT", "STUB_GH_FAIL", "STUB_SYSTEMCTL",
-                "STUB_READ_RACE", "STUB_CRON_READ_FAIL", "STUB_RACE_ACTOR"):
+                "STUB_READ_RACE", "STUB_CRON_READ_FAIL", "STUB_RACE_ACTOR", "STUB_TOUCH_LABELS"):
         env.pop(key, None)
     (tmp / "home").mkdir()
     config = tmp / "config/parley-axi/config.json"
@@ -60,8 +61,8 @@ with tempfile.TemporaryDirectory(prefix="parley-review-") as tmp:
                          {"name": "to:" + ("alice" if sender == "bob" else "bob")},
                          {"name": "status:" + status}]})
         for member in ("alice", "bob"):
-            receipt = tmp / f"state/parley-axi/team/{member}/read.json"
-            receipt.unlink(missing_ok=True)
+            for name in ("read", "activity", "state", "pending"):
+                (tmp / f"state/parley-axi/team/{member}/{name}.json").unlink(missing_ok=True)
 
     def call(*args, member="alice", extra=None, ok=True):
         result = subprocess.run([str(ROOT / "bin/parley-axi"), "--as", member, *args],
@@ -71,11 +72,13 @@ with tempfile.TemporaryDirectory(prefix="parley-review-") as tmp:
         return result.stdout
 
     def unread(member="alice"):
+        call("sync", "--no-commit", "--json", member=member)
         return [item["number"] for item in json.loads(call("list", "--unread", "--json", member=member))]
 
     def mutate(expression):
         data = json.loads(file.read_text())
         expression(data)
+        data["updatedAt"] = (datetime.fromisoformat(data["updatedAt"].replace("Z", "+00:00")) + timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
         save(data)
 
     fixture()
@@ -170,6 +173,78 @@ with tempfile.TemporaryDirectory(prefix="parley-review-") as tmp:
     assert (tmp / "state/parley-axi/team/alice/read.json").read_bytes() == before
     print("ok concurrent incoming activity survives; concurrent own activity stays read")
 
+    fixture()
+    call("show", "1")
+    stale = json.loads(file.read_text())
+    mutate(lambda d: d["comments"].append({"id": "known-new", "body": "Unseen newer content",
+                                          "author": {"login": "bob-gh"}, "createdAt": "2026-11-05T12:00:00Z"}))
+    assert unread() == [1]
+    latest = json.loads(file.read_text())
+    save(stale)
+    assert "Unseen newer content" not in call("show", "1")
+    assert [item["number"] for item in json.loads(call("list", "--unread", "--json"))] == [1]
+    save(latest)
+    call("show", "1")
+    assert unread() == []
+    print("ok stale show cannot discard known unread activity or cached versions")
+
+    fixture()
+    long_body = "x" * 50_000
+    mutate(lambda d: d["comments"].extend([
+        {"id": f"long-{i}", "body": long_body, "author": {"login": "bob-gh"},
+         "createdAt": "2026-11-05T11:00:00Z", "edits": []} for i in range(3)
+    ]))
+    assert unread() == [1]
+    shown = json.loads(call("show", "1", "--json"))
+    assert [c["body"] for c in shown["comments"]] == [long_body] * 3
+    assert unread() == []
+    unicode_body = "🌴" * 50_000
+    mutate(lambda d: (d.update(body=unicode_body), d["comments"][0].update(body=unicode_body),
+                      d["comments"][0]["edits"].append({"id": "unicode-edit", "editor": {"login": "bob-gh"}})))
+    shown = json.loads(call("show", "1", "--json"))
+    assert shown["body"] == unicode_body and shown["comments"][0]["body"] == unicode_body
+    assert unread() == []
+    mutate(lambda d: d["edits"].extend([
+        {"id": f"edit-{i}-" + "e" * 64, "editor": {"login": "bob-gh"}} for i in range(2_000)
+    ]))
+    assert unread() == [1]
+    call("show", "1", "--json")
+    assert unread() == []
+    print("ok long comment collections and activity receipts use stream transport")
+
+    fixture()
+    data = json.loads(file.read_text())
+    second = {**data, "number": 2, "id": "thread-2", "title": "Second request", "url": "https://x/2"}
+    (stub / "acme__team.issue-2.json").write_text(json.dumps(second))
+    listing = json.loads((stub / "acme__team.issues.json").read_text())
+    listing.append({**listing[0], "number": 2, "title": "Second request", "html_url": "https://x/2"})
+    (stub / "acme__team.issues.json").write_text(json.dumps(listing))
+    lock = tmp / "state/parley-axi/team/alice/state.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    import fcntl
+    with lock.open("w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        readers = [subprocess.Popen([str(ROOT / "bin/parley-axi"), "show", str(n), *mode],
+                                    env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                   for n, mode in ((1, ()), (2, ("--json",)))]
+        headers = [reader.stdout.readline() for reader in readers]
+        assert "Review request" in headers[0] and "Second request" in headers[1]
+        assert all(reader.poll() is None for reader in readers)
+        fcntl.flock(held, fcntl.LOCK_UN)
+    for reader in readers:
+        stdout, stderr = reader.communicate(timeout=30)
+        assert reader.returncode == 0, stderr
+    assert unread() == []
+    receipts = json.loads((lock.parent / "read.json").read_text())
+    assert receipts["1"] == ["thread-1"] and receipts["2"] == ["thread-2"]
+    (stub / "acme__team.issue-2.json").unlink()
+    fixture()
+    call("show", "1")
+    mutate(lambda d: d["comments"].append({"id": "scheduler-new", "body": "Notify",
+                                          "createdAt": "2026-11-05T12:00:00Z", "author": {"login": "bob-gh"}}))
+    assert unread() == [1]
+    print("ok simultaneous text/JSON shows preserve both receipts")
+
     runner = tmp / "state/parley-axi/schedule/team/alice/tick.sh"
     notification = tmp / "notification"
     call("schedule", "install", "--every", "5m", "--notify", f"cat > '{notification}'",
@@ -192,6 +267,55 @@ with tempfile.TemporaryDirectory(prefix="parley-review-") as tmp:
     assert "1 unread message(s): #1 unread from bob: Review request" in result.stdout
     call("schedule", "remove", extra={"STUB_SYSTEMCTL": "1"})
     print("ok heartbeat stdin, silent read tick, and check share unread computation")
+
+    fixture()
+    call("sync", "--json")
+    Path(env["STUB_LOG"]).write_text("")
+    call("schedule", "install", "--every", "5m", "--notify", "true", extra={"STUB_SYSTEMCTL": "1"})
+    Path(env["STUB_LOG"]).write_text("")
+    call("schedule", "tick")
+    requests = Path(env["STUB_LOG"]).read_text().splitlines()
+    assert sum(line.startswith("api --paginate repos/acme/team/issues?") for line in requests) == 1
+    assert not any(line.startswith("api graphql") or line.startswith("issue ") for line in requests)
+    call("schedule", "remove", extra={"STUB_SYSTEMCTL": "1"})
+    fixture(sender="alice")
+    call("sync", "--json")
+    Path(env["STUB_LOG"]).write_text("")
+    call("sync", "--json")
+    requests = Path(env["STUB_LOG"]).read_text().splitlines()
+    assert sum(line.startswith("api --paginate repos/acme/team/issues?") for line in requests) == 1
+    assert any("since=2026-11-05T09:50:00Z" in line for line in requests)
+    assert not any(line.startswith("api graphql") for line in requests)
+    print("ok unchanged heartbeat costs one list request; sent-only inboxes retain an incremental cursor")
+
+    for step in ("write-pending", "emit", "commit", "swap"):
+        fixture()
+        failed = subprocess.run([str(ROOT / "bin/parley-axi"), "sync", "--json"],
+                                env={**env, "PARLEY_CRASH_AT": step}, text=True, capture_output=True)
+        assert failed.returncode == 70, (step, failed.stderr)
+        recovered = json.loads(call("sync", "--json"))
+        assert [(item["number"], item["event"]) for item in recovered] == [(1, "new")]
+        assert json.loads(call("sync", "--json")) == []
+    print("ok incremental cache preserves at-least-once delivery across every sync crash point")
+
+    repo_config = stub / "acme__team.parley.json"
+    original_config = repo_config.read_text()
+    roles = ("to", "from", "status", "unread")
+    for shorter in roles:
+        for longer in roles:
+            if shorter == longer:
+                continue
+            candidate = json.loads(original_config)
+            candidate["labels"] = {role: role + ":" for role in roles}
+            candidate["labels"][shorter] = "u"
+            candidate["labels"][longer] = "unread:"
+            repo_config.write_text(json.dumps(candidate))
+            Path(env["STUB_LOG"]).write_text("")
+            call("sync", ok=False)
+            assert not any(line.startswith(("issue edit", "label create"))
+                           for line in Path(env["STUB_LOG"]).read_text().splitlines())
+    repo_config.write_text(original_config)
+    print("ok every ordered prefix-overlap pair is rejected before publishing labels")
 
     cron = stub / "crontab"
     cron.write_text("17 * * * * echo unrelated-job\n")

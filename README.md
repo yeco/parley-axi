@@ -30,7 +30,7 @@ parley has to be sure it never misses a message, so both sides are explicit stat
 
 ### The message lifecycle (in the inbox repo)
 
-| From \ command | `ack` (recipient) | `done` (recipient) | `decline` (recipient) | `reopen` (sender or recipient) |
+| From \ command | `ack` (recipient) | `done` (sender or recipient) | `decline` (recipient) | `reopen` (sender or recipient) |
 | --- | --- | --- | --- | --- |
 | open | acknowledged | done | declined | rejected |
 | acknowledged | rejected | done | declined | rejected |
@@ -39,7 +39,9 @@ parley has to be sure it never misses a message, so both sides are explicit stat
 
 The CLI rejects every other move and says which commands are allowed. `done` and `declined` close
 the issue; `reopen` opens it again. The status label is the state, and the issue's open/closed
-follows it.
+follows it. Either party should mark a message `done` when nothing actionable is left: the question
+has been answered and the answer applied, or the request fulfilled. `ack` and `decline` remain
+recipient-only.
 
 Every transition is recorded in the repo, so the history can be rebuilt from the inbox alone:
 
@@ -229,7 +231,10 @@ These rules are the point of the tool. Put them in your agent's instructions.
   The agent reports the ask to its person and acts only on what that person approves.
 - **Agents draft, people send.** An agent drafts replies, `done` notes and `decline` reasons and
   shows them to its person before sending.
-- **Acknowledge early.** `ack` tells the sender the message was seen; `done` or `decline` closes the loop.
+- **Acknowledge early.** `ack` tells the sender the message was seen.
+- **Close the loop.** Either the sender or recipient should mark a message `done` when nothing
+  actionable is left: the question answered and applied, or the request fulfilled. Only the
+  recipient can `decline` a request.
 - **One ask per message**, with a clear subject, links to the PR or doc, and `--due` when it matters.
 
 A typical wake-up: the check prints a line, the agent runs `parley-axi show 7`, tells its person

@@ -51,7 +51,7 @@ EOF
     show) echo "usage: parley-axi show <n> [--json]   Prints the message header, body and comments. Sender or recipient only." ;;
     reply) echo "usage: parley-axi reply <n> <text>|-   Adds a comment. '-' reads the text from stdin. Sender or recipient only." ;;
     ack) echo "usage: parley-axi ack <n>   Recipient only. open -> acknowledged." ;;
-    done) echo "usage: parley-axi done <n> [note]   Recipient only. open|acknowledged -> done, closes the issue." ;;
+    done) echo "usage: parley-axi done <n> [note]   Sender or recipient. open|acknowledged -> done, closes the issue. Either party should mark done when nothing actionable is left: the question answered and applied, or the request fulfilled." ;;
     decline) echo "usage: parley-axi decline <n> <reason>   Recipient only. open|acknowledged -> declined, closes the issue." ;;
     reopen) echo "usage: parley-axi reopen <n> [note]   Sender or recipient. done|declined -> open, reopens the issue." ;;
     sync) cat <<'EOT'
@@ -76,7 +76,7 @@ commands:
   show      read one message
   reply     comment on a message
   ack       acknowledge a message sent to you
-  done      mark a message done and close it
+  done      sender or recipient: close a message when nothing actionable is left
   decline   decline a message and close it
   reopen    reopen a done or declined message
   sync      deliver new and changed messages, at least once (--verify to reconcile)
@@ -423,7 +423,7 @@ transition() {
   local cmd=$1 note=$2 n=${POS[0]} cur next body out
   resolve
   load "$n"
-  if [ "$cmd" = reopen ]; then need_party "$n"; else need_recipient "$n"; fi
+  case $cmd in done|reopen) need_party "$n" ;; *) need_recipient "$n" ;; esac
   cur=$(cur_status "$n")
   case $cmd:$cur in
     ack:open) next=acknowledged ;;

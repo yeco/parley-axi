@@ -43,6 +43,7 @@ run --help; expect "help lists commands" '[[ $rc == 0 && $out == *decline* && $o
 for c in init setup inboxes send list show reply ack "done" decline reopen sync; do
   run "$c" --help; expect "$c --help" '[[ $rc == 0 && $out == *usage:* ]]'
 done
+run "done" --help; expect "done help names either party and when to close" '[[ $rc == 0 && $out == *"Sender or recipient"* && $out == *"nothing actionable is left"* ]]' "$out"
 run frobnicate; expect "unknown command fails" '[[ $rc != 0 && $out == *"unknown command"* ]]'
 run list; expect "no local config fails clearly" '[[ $rc != 0 && $out == *"parley-axi setup"* ]]' "$out"
 
@@ -192,12 +193,25 @@ declined reopen open
 EOF
 reset; "$px" "done" 7 "merged it" >/dev/null 2>&1 || true
 issue "$team" 9 OPEN to:alice from:bob status:acknowledged
-reset; "$px" "done" 9 merged it >/dev/null; expect "done note goes into the record" 'logged "merged it"'
+reset; "$px" "done" 9 merged it >/dev/null; expect "recipient done note goes into the record" 'logged "merged it"'
 run decline 9; expect "decline needs a reason" '[[ $rc != 0 && $out == *usage:* ]]'
 issue "$team" 21 CLOSED to:alice from:bob status:done
 reset; run --as bob reopen 21 not fixed; expect "the sender can reopen" '[[ $rc == 0 && $out == "#21 done -> open" ]] && logged "by bob"' "$out"
 issue "$team" 22 OPEN to:alice from:bob status:open
-run --as bob ack 22; expect "the sender cannot ack" '[[ $rc != 0 && $out == *"addressed to alice"* ]]'
+reset; run --as bob "done" 22 answer applied
+expect "the sender can mark an open message done" '[[ $rc == 0 && $out == "#22 open -> done" ]] && logged "issue close 22" && logged "--add-label status:done --remove-label status:open"' "$out"
+expect "sender done records who closed it and the note" 'logged "parley: open -> done by bob" && logged "<!-- parley-transition {\"v\":1,\"from\":\"open\",\"to\":\"done\",\"by\":\"bob\"} -->" && logged "answer applied"' "$(cat "$STUB_LOG")"
+reset; run --as bob ack 22; expect "the sender cannot ack" '[[ $rc != 0 && $out == *"addressed to alice"* ]] && ! logged "issue comment" && ! logged "issue edit"'
+reset; run --as bob decline 22 not needed; expect "the sender cannot decline" '[[ $rc != 0 && $out == *"addressed to alice"* ]] && ! logged "issue comment" && ! logged "issue close" && ! logged "issue edit"'
+issue "$team" 25 OPEN to:alice from:bob status:acknowledged
+reset; run --as bob "done" 25 request fulfilled
+expect "the sender can mark an acknowledged message done" '[[ $rc == 0 && $out == "#25 acknowledged -> done" ]] && logged "by bob" && logged "issue close 25" && logged "--add-label status:done --remove-label status:acknowledged"' "$out"
+for st in open acknowledged; do
+  label=state/new; [ "$st" != acknowledged ] || label=state/seen
+  issue "$ops" 26 OPEN for/carol by/carol "$label"
+  reset; run --inbox ops "done" 26 not mine
+  expect "a non-party cannot mark an $st message done" '[[ $rc != 0 && $out == *"between carol and carol, not you (alice)"* ]] && ! logged "issue comment" && ! logged "issue close" && ! logged "issue edit"' "$out"
+done
 issue "$team" 23 CLOSED to:alice from:bob status:open
 reset; run "done" 23
 expect "rerun finishes a transition that crashed before its label" '[[ $rc == 0 ]] && ! logged "issue close" && logged "--add-label status:done --remove-label status:open"' "$out"

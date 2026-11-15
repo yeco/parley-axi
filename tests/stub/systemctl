@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Isolated scheduler boundary: user systemd is available only when explicitly enabled.
+printf '%s\n' "systemctl $*" >> "$STUB_LOG"
+[ "${STUB_SYSTEMCTL:-}" = 1 ] || exit 1
+case "$*" in
+  *show-environment*) echo 'LANG=C' ;;
+  *is-enabled*|*is-active*) [ -f "$STUB_DIR/timer-active" ] ;;
+  *enable*) : > "$STUB_DIR/timer-active" ;;
+  *disable*) rm -f "$STUB_DIR/timer-active" ;;
+esac

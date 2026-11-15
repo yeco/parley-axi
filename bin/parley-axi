@@ -10,11 +10,12 @@ CONFIG_FILE=.parley.json
 INIT_BRANCH=parley-init
 STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/parley-axi
 OVERLAP=${PARLEY_OVERLAP:-600}
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
 # Defaults merged under the repo's config; jq's `*` merges nested objects.
-DEFAULTS='{"labels":{"to":"to:","from":"from:","status":"status:",
+DEFAULTS='{"labels":{"to":"to:","from":"from:","status":"status:","unread":"unread:",
   "statuses":{"open":"open","acknowledged":"acknowledged","done":"done","declined":"declined"},
-  "colors":{"to":"1d76db","from":"5319e7","status":"fbca04"}}}'
+  "colors":{"to":"1d76db","from":"5319e7","status":"fbca04","unread":"d93f0b"}}}'
 
 die() { echo "parley-axi: $*" >&2; exit 1; }
 
@@ -37,23 +38,38 @@ EOF
     inboxes) echo "usage: parley-axi inboxes [--json]   Lists the configured inboxes: name repo member (* marks the default)." ;;
     send) cat <<'EOF'
 usage: parley-axi send --to <member-id> --subject <s> [--body <text>|--body-file <file|->] [--link <url>]... [--due YYYY-MM-DD] [--json]
-Creates one issue labelled with the to, from and open-status labels. Body text comes first, then links and due date.
+Creates one issue labelled with to, from, open-status, and unread for the recipient (never for yourself).
+Unread labels are created on demand. Body text comes first, then links and due date.
 EOF
     ;;
     list) cat <<'EOF'
-usage: parley-axi list [--all] [--sent] [--json]
+usage: parley-axi list [--all] [--sent] [--unread] [--json]
 Default: open messages addressed to you. --sent: messages you sent. --all: include closed ones.
+--unread: all threads unread for you, including sent and closed messages; does not mark them read.
+Unread labels in list/show tell the sender who has not read the latest activity.
 Lines: #number from:<who> <status> <age> "subject" url   (--sent shows to:<who>)
---json: [{number,subject,from,to,status,state,comments,createdAt,updatedAt,url}], newest update first.
+--json: [{number,subject,from,to,status,unread,unreadFrom,state,comments,createdAt,updatedAt,url}], newest update first.
 status is the lifecycle state (open, acknowledged, done, declined), or none/conflict/unknown when the labels are broken.
 EOF
     ;;
-    show) echo "usage: parley-axi show <n> [--json]   Prints the message header, body and comments. Sender or recipient only." ;;
-    reply) echo "usage: parley-axi reply <n> <text>|-   Adds a comment. '-' reads the text from stdin. Sender or recipient only." ;;
+    show) echo "usage: parley-axi show <n> [--json]   Prints the message header, body and comments, then clears your unread marker. Sender or recipient only." ;;
+    reply) echo "usage: parley-axi reply <n> <text>|-   Adds a comment and marks it unread for the other party. '-' reads stdin. Sender or recipient only." ;;
     ack) echo "usage: parley-axi ack <n>   Recipient only. open -> acknowledged." ;;
     done) echo "usage: parley-axi done <n> [note]   Sender or recipient. open|acknowledged -> done, closes the issue. Either party should mark done when nothing actionable is left: the question answered and applied, or the request fulfilled." ;;
     decline) echo "usage: parley-axi decline <n> <reason>   Recipient only. open|acknowledged -> declined, closes the issue." ;;
     reopen) echo "usage: parley-axi reopen <n> [note]   Sender or recipient. done|declined -> open, reopens the issue." ;;
+    schedule) cat <<'EOF'
+usage: parley-axi schedule install [--every <interval>] --notify '<command>'
+       parley-axi schedule status | schedule remove
+Installs a systemd user timer where available, otherwise a crontab entry, for this inbox/member.
+--every: positive integer with s, m, h or d (default 5m). Cron supports intervals dividing an hour
+in whole minutes, or a day in whole hours (e.g. 5m, 15m, 1h, 1d).
+Each tick syncs and invokes the shell command only for unread-to-you messages, even on sent or
+closed threads. The one-line summary is passed on stdin and in PARLEY_UNREAD. No tick output.
+Unread repeats until show clears it. Failed notification does not commit the pending sync.
+status shows the backend and interval; remove removes only this inbox/member's schedule.
+EOF
+    ;;
     sync) cat <<'EOT'
 usage: parley-axi sync [--json] [--no-commit] | sync --commit | sync --verify [--json]
 Delivers every message to you that is new or changed since the last sync (new message, new comments,
@@ -80,6 +96,7 @@ commands:
   decline   decline a message and close it
   reopen    reopen a done or declined message
   sync      deliver new and changed messages, at least once (--verify to reconcile)
+  schedule  install, inspect or remove an unread heartbeat
 Every command takes --help. --inbox and --as also work after the command.
 env: PARLEY_INBOX (inbox name), XDG_CONFIG_HOME (local config at $XDG_CONFIG_HOME/parley-axi/config.json)
 EOF
@@ -101,7 +118,7 @@ parse() {
         [[ $allowed == *" $1 "* ]] || die "$cmd: unknown option '$1' (see parley-axi $cmd --help)"
         opt=${1#--}
         case $1 in
-          --json|--all|--sent|--direct|--default|--verify|--no-commit|--commit) printf -v "F_${opt//-/_}" 1; shift; continue ;;
+          --json|--all|--sent|--unread|--direct|--default|--verify|--no-commit|--commit) printf -v "F_${opt//-/_}" 1; shift; continue ;;
         esac
         [ $# -ge 2 ] || die "$cmd: $1 needs a value"
         case $1 in
@@ -116,7 +133,8 @@ parse() {
   done
 }
 F_inbox="" F_as="" F_repo="" F_name="" F_to="" F_subject="" F_body="" F_body_file="" F_due=""
-F_json="" F_all="" F_sent="" F_direct="" F_default="" F_verify="" F_no_commit="" F_commit=""
+F_json="" F_all="" F_sent="" F_unread="" F_direct="" F_default="" F_verify="" F_no_commit="" F_commit=""
+F_every="5m" F_notify=""
 F_link=() F_member=()
 
 require_gh() {
@@ -144,13 +162,13 @@ use_config() {
          elif (.id | type) != "string" or (.id | test("^[A-Za-z0-9._-]+$") | not) then "member id \(.id | tojson) must match [A-Za-z0-9._-]+"
          elif (.github | nonempty | not) then "member \(.id) needs a github login" else empty end),
          (.members | map(.id) | group_by(.)[] | select(length > 1) | "duplicate member id \(.[0])") end),
-      (if ([.labels.to, .labels.from, .labels.status] | all(nonempty) | not) then "labels.to, labels.from and labels.status must be non-empty strings"
-       elif ([.labels.to, .labels.from, .labels.status] | unique | length) != 3 then "labels.to, labels.from and labels.status must differ" else empty end),
+      (if ([.labels.to, .labels.from, .labels.status, .labels.unread] | all(nonempty) | not) then "labels.to, labels.from, labels.status and labels.unread must be non-empty strings"
+       elif ([.labels.to, .labels.from, .labels.status, .labels.unread] | unique | length) != 4 then "labels.to, labels.from, labels.status and labels.unread must differ" else empty end),
       (if ([.labels.statuses | .open, .acknowledged, .done, .declined] | all(nonempty) | not) then "labels.statuses needs open, acknowledged, done and declined"
        elif ([.labels.statuses | .open, .acknowledged, .done, .declined] | unique | length) != 4 then "labels.statuses values must differ" else empty end)
     ] | first // empty' <<<"$CFG" 2>/dev/null) || die "$REPO/$CONFIG_FILE has an invalid shape"
   [ -z "$err" ] || die "$REPO/$CONFIG_FILE: $err"
-  eval "$(jq -r '.labels | @sh "P_TO=\(.to) P_FROM=\(.from) P_ST=\(.status) S_OPEN=\(.statuses.open) S_ACK=\(.statuses.acknowledged) S_DONE=\(.statuses.done) S_DECL=\(.statuses.declined)"' <<<"$CFG")"
+  eval "$(jq -r '.labels | @sh "P_TO=\(.to) P_FROM=\(.from) P_ST=\(.status) P_UNREAD=\(.unread) S_OPEN=\(.statuses.open) S_ACK=\(.statuses.acknowledged) S_DONE=\(.statuses.done) S_DECL=\(.statuses.declined)"' <<<"$CFG")"
 }
 
 is_member() { jq -e --arg id "$1" 'any(.members[]; .id == $id)' <<<"$CFG" >/dev/null; }
@@ -164,13 +182,19 @@ labels_tsv() {
 }
 
 # resolve: picks the inbox (--inbox, PARLEY_INBOX, then the default), sets INBOX, REPO, ME and loads the repo config.
-resolve() {
+resolve_local() {
   [ -f "$CONF" ] || die "no inbox configured: run parley-axi setup --repo <owner/name> --as <member-id>"
   INBOX=${F_inbox:-${PARLEY_INBOX:-$(jq -r '.default // empty' "$CONF")}}
   [ -n "$INBOX" ] || die "no default inbox: pass --inbox <name> (see parley-axi inboxes)"
   REPO=$(jq -r --arg n "$INBOX" '.inboxes[$n].repo // empty' "$CONF")
   [ -n "$REPO" ] || die "unknown inbox '$INBOX' (see parley-axi inboxes)"
   ME=${F_as:-$(jq -r --arg n "$INBOX" '.inboxes[$n].member // empty' "$CONF")}
+  [[ $INBOX =~ ^[A-Za-z0-9._-]+$ && $ME =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid inbox or member id"
+  case $INBOX:$ME in .:*|..:*|*:.|*:..) die "inbox and member ids cannot be '.' or '..'" ;; esac
+}
+
+resolve() {
+  resolve_local
   require_gh
   fetch_config || die "$REPO has no $CONFIG_FILE: run parley-axi init --repo $REPO"
   use_config "$RAW"
@@ -226,12 +250,32 @@ cur_status() {
   esac
 }
 
+ensure_unread_label() {
+  local color
+  color=$(jq -r '.labels.colors.unread | ltrimstr("#")' <<<"$CFG")
+  gh label create "$P_UNREAD$1" -R "$REPO" --color "$color" \
+    --description "Unread for $1" --force >/dev/null
+}
+
+# Mark before posting: a failed post can leave an extra unread, but cannot hide a successful one.
+mark_other_unread() {
+  local party
+  for party in "$(label_val "$P_TO")" "$(label_val "$P_FROM")"; do
+    [ -n "$party" ] && [ "$party" != "$ME" ] || continue
+    ensure_unread_label "$party"
+    gh issue edit "$1" -R "$REPO" --add-label "$P_UNREAD$party" >/dev/null
+  done
+}
+
 # set_status <n> <label>: leaves exactly one status label on the issue.
 set_status() {
   local args=(--add-label "$2") l
   while IFS= read -r l; do
     if [[ $l == "$P_ST"* && $l != "$2" ]]; then args+=(--remove-label "$l"); fi
   done <<<"$LABELS"
+  for l in "$(label_val "$P_TO")" "$(label_val "$P_FROM")"; do
+    if [ -n "$l" ] && [ "$l" != "$ME" ]; then args+=(--add-label "$P_UNREAD$l"); fi
+  done
   gh issue edit "$1" -R "$REPO" "${args[@]}" >/dev/null
 }
 
@@ -241,7 +285,7 @@ JQ_NORM='def lab($p): [.labels[] | select(startswith($p)) | ltrimstr($p)];
   def norm($l): ($l.statuses | to_entries | map({key: .value, value: .key}) | from_entries) as $roles |
     {number, subject: .title, from: (lab($l.from) | first), to: (lab($l.to) | first),
      status: (lab($l.status) | if length == 1 then ($roles[.[0]] // "unknown") elif length == 0 then "none" else "conflict" end),
-     state, comments, createdAt: .created_at, updatedAt: .updated_at, url: .html_url};'
+     unread: lab($l.unread), unreadFrom: (if (lab($l.from) | first) == $me then (lab($l.to) | first) else (lab($l.from) | first) end), state, comments, createdAt: .created_at, updatedAt: .updated_at, url: .html_url};'
 
 # fetch_issues <label> <open|closed|all> [since]: every matching message, all pages, oldest update first, as one JSON array.
 fetch_issues() {
@@ -249,7 +293,7 @@ fetch_issues() {
   q="labels=$(jq -rn --arg l "$1" '$l | @uri')&state=$2&sort=updated&direction=asc&per_page=100${3:+&since=$3}"
   gh api --paginate "repos/$REPO/issues?$q" \
     --jq '.[] | select(.pull_request == null) | {number, title, state, comments, created_at, updated_at, html_url, labels: [.labels[].name]}' |
-    jq -cs --argjson l "$(jq -c .labels <<<"$CFG")" "$JQ_NORM map(norm(\$l))"
+    jq -cs --arg me "$ME" --argjson l "$(jq -c .labels <<<"$CFG")" "$JQ_NORM map(norm(\$l))"
 }
 
 # crashpoint <step>: test hook that simulates a crash right before <step>.
@@ -338,7 +382,7 @@ cmd_inboxes() {
 cmd_send() {
   parse send "--to --subject --body --body-file --link --due --json" "$@"
   [ ${#POS[@]} -eq 0 ] || die "send: unexpected argument '${POS[0]}' (see parley-axi send --help)"
-  local body=$F_body parts=() msg="" p url
+  local body=$F_body parts=() msg="" p url unread=()
   resolve
   [ -n "$F_to" ] || die "send: --to is required (members: $(member_ids))"
   is_member "$F_to" || die "send: '$F_to' is not a member of $REPO (members: $(member_ids))"
@@ -363,8 +407,12 @@ cmd_send() {
   parts+=("<!-- parley-message {\"v\":1,\"from\":\"$ME\",\"to\":\"$F_to\"} -->")
   for p in "${parts[@]}"; do msg+="${msg:+$'\n\n'}$p"; done
 
+  if [ "$F_to" != "$ME" ]; then
+    ensure_unread_label "$F_to"
+    unread=(--label "$P_UNREAD$F_to")
+  fi
   url=$(gh issue create -R "$REPO" --title "$F_subject" --body "$msg" \
-    --label "$P_TO$F_to" --label "$P_FROM$ME" --label "$(status_label open)")
+    --label "$P_TO$F_to" --label "$P_FROM$ME" --label "$(status_label open)" ${unread[@]+"${unread[@]}"})
   if [ -n "$F_json" ]; then
     jq -nc --argjson n "${url##*/}" --arg u "$url" --arg t "$F_to" '{number: $n, to: $t, url: $u}'
   else
@@ -373,18 +421,21 @@ cmd_send() {
 }
 
 cmd_list() {
-  parse list "--all --sent --json" "$@"
+  parse list "--all --sent --unread --json" "$@"
   [ ${#POS[@]} -eq 0 ] || die "list: unexpected argument '${POS[0]}' (see parley-axi list --help)"
   resolve
   local state=open mine=$P_TO show=from out
   if [ -n "$F_all" ]; then state=all; fi
   if [ -n "$F_sent" ]; then mine=$P_FROM show=to; fi
-  out=$(fetch_issues "$mine$ME" "$state" | jq -c reverse) || die "gh failed listing messages in $REPO"
+  if [ -n "$F_unread" ]; then state=all; mine=$P_UNREAD; fi
+  out=$(fetch_issues "$mine$ME" "$state" | jq -c --arg me "$ME" --arg sent "$F_sent" '
+    map(select(.to == $me or .from == $me) | select($sent == "" or .from == $me)) | reverse') \
+    || die "gh failed listing messages in $REPO"
   if [ -n "$F_json" ]; then echo "$out"; return; fi
   out=$(jq -r --arg show "$show" '
     def age: if . < 60 then "\(.)s" elif . < 3600 then "\(./60|floor)m"
              elif . < 86400 then "\(./3600|floor)h" else "\(./86400|floor)d" end;
-    .[] | "#\(.number) \($show):\(.[$show] // "-") \(.status) \((now - (.createdAt | fromdateiso8601)) | floor | age) \"\(.subject)\" \(.url)"' <<<"$out")
+    .[] | "#\(.number) \($show):\(.[$show] // "-") \(.status) \((now - (.createdAt | fromdateiso8601)) | floor | age) \"\(.subject)\"\(if (.unread | length) > 0 then " unread:" + (.unread | join(",")) else "" end) \(.url)"' <<<"$out")
   echo "${out:-no messages}"
 }
 
@@ -396,15 +447,37 @@ cmd_show() {
   need_party "${POS[0]}"
   local out
   out=$(gh issue view "${POS[0]}" -R "$REPO" --json number,title,body,state,labels,author,comments,createdAt,updatedAt,url)
-  if [ -n "$F_json" ]; then echo "$out"; return; fi
+  if [ -n "$F_json" ]; then echo "$out"; else
   # Rendered here because gh's non-TTY --comments output drops the body.
-  jq -r --arg to "$P_TO" --arg from "$P_FROM" --arg st "$P_ST" '
+  jq -r --arg to "$P_TO" --arg from "$P_FROM" --arg st "$P_ST" --arg unread "$P_UNREAD" '
     def lab($p): [.labels[].name | select(startswith($p)) | ltrimstr($p)] | first // "-";
     def text: split("\n") | map(select(startswith("<!-- parley-") | not)) | join("\n") | sub("\\s+$"; "");
     "#\(.number) \(.title)",
     "from:\(lab($from)) to:\(lab($to)) status:\(lab($st)) \(.state | ascii_downcase) \(.createdAt) \(.url)",
+    "unread: \([.labels[].name | select(startswith($unread)) | ltrimstr($unread)] | if length == 0 then "none" else join(", ") end)",
     "", (.body | text | select(. != "")),
     (.comments[] | "", "--- \(.author.login) \(.createdAt)", (.body | text))' <<<"$out"
+  fi
+  # Output must succeed before read receipt. Recheck content, not updatedAt (label removal changes it).
+  local latest before after
+  if jq -e --arg l "$P_UNREAD$ME" 'any(.labels[]; .name == $l)' <<<"$out" >/dev/null; then
+    gh issue edit "${POS[0]}" -R "$REPO" --remove-label "$P_UNREAD$ME" >/dev/null
+    if ! latest=$(gh issue view "${POS[0]}" -R "$REPO" --json number,title,body,state,labels,author,comments,createdAt,updatedAt,url); then
+      ensure_unread_label "$ME"
+      gh issue edit "${POS[0]}" -R "$REPO" --add-label "$P_UNREAD$ME" >/dev/null
+      die "could not confirm read of #${POS[0]}; left unread"
+    fi
+    before=$(read_version "$out")
+    after=$(read_version "$latest")
+    if [ "$before" != "$after" ]; then
+      ensure_unread_label "$ME"
+      gh issue edit "${POS[0]}" -R "$REPO" --add-label "$P_UNREAD$ME" >/dev/null
+    fi
+  fi
+}
+
+read_version() {
+  jq -cS --arg st "$P_ST" '{title,body,comments,state,status: [.labels[].name | select(startswith($st))] | sort}' <<<"$1"
 }
 
 cmd_reply() {
@@ -416,7 +489,9 @@ cmd_reply() {
   need_party "$n"
   if [ "$text" = - ]; then text=$(cat); fi
   [ -n "$text" ] || die "reply text is empty"
+  mark_other_unread "$n"
   gh issue comment "$n" -R "$REPO" --body "$text" >/dev/null
+  mark_other_unread "$n"
   echo "replied on #$n"
 }
 
@@ -439,7 +514,9 @@ transition() {
   esac
   body="parley: $cur -> $next by $ME"$'\n'"<!-- parley-transition {\"v\":1,\"from\":\"$cur\",\"to\":\"$next\",\"by\":\"$ME\"} -->"
   if [ -n "$note" ]; then body+=$'\n\n'"$note"; fi
+  mark_other_unread "$n"
   gh issue comment "$n" -R "$REPO" --body "$body" >/dev/null
+  mark_other_unread "$n"
   # gh prints its own success line on stderr, so keep stderr only when the call fails
   case $next:$STATE in
     done:OPEN|declined:OPEN) out=$(gh issue close "$n" -R "$REPO" 2>&1) || die "gh failed closing #$n: $out" ;;
@@ -545,6 +622,117 @@ verify() {
   [ "$(jq '.problems | length' <<<"$out")" = 0 ]
 }
 
+# Schedule files are local to an inbox/member; removing one never touches another timer or cron job.
+schedule_paths() {
+  SDIR="$STATE_DIR/schedule/$INBOX/$ME"
+  UNIT="parley-axi-$INBOX:$ME"
+  UDIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+  TAG="# parley-axi:$INBOX:$ME"
+}
+
+cron_read() {
+  local out
+  if out=$(crontab -l 2>&1); then printf '%s\n' "$out"; else
+    case $out in *"no crontab for"*) ;; *) die "cannot read crontab: $out" ;; esac
+  fi
+}
+
+cron_without_schedule() { cron_read | awk -v tag="$TAG" 'substr($0, length($0) - length(tag) + 1) != tag'; }
+
+schedule_remove() {
+  [ -f "$SDIR/config.json" ] || return 0
+  local backend
+  backend=$(jq -r .backend "$SDIR/config.json")
+  case $backend in
+    systemd)
+      systemctl --user disable --now "$UNIT.timer" >/dev/null
+      rm -f "$UDIR/$UNIT.timer" "$UDIR/$UNIT.service"
+      systemctl --user daemon-reload >/dev/null ;;
+    cron) cron_without_schedule | crontab - ;;
+    *) die "unknown schedule backend '$backend'" ;;
+  esac
+  rm -f "$SDIR/config.json" "$SDIR/tick.sh"
+}
+
+cmd_schedule() {
+  parse schedule "--every --notify" "$@"
+  [ ${#POS[@]} -eq 1 ] || die "usage: parley-axi schedule install|status|remove|tick (see --help)"
+  local action=${POS[0]} backend seconds value suffix expression="" runner active="inactive" data
+  resolve_local
+  schedule_paths
+  case $action in
+    status)
+      if [ ! -f "$SDIR/config.json" ]; then echo "schedule $INBOX as $ME: not installed"; return; fi
+      backend=$(jq -r .backend "$SDIR/config.json")
+      seconds=$(jq -r .seconds "$SDIR/config.json")
+      case $backend in
+        systemd) if systemctl --user is-active --quiet "$UNIT.timer"; then active=active; fi ;;
+        cron) if cron_read | grep -qF "$TAG"; then active=active; fi ;;
+      esac
+      echo "schedule $INBOX as $ME: $backend every ${seconds}s ($active)" ;;
+    remove) schedule_remove; echo "schedule $INBOX as $ME: removed" ;;
+    install)
+      [ -n "$F_notify" ] || die "schedule install: --notify is required"
+      [[ $F_every =~ ^([0-9]{1,9})([smhd]?)$ ]] || die "schedule interval must be a positive integer with s, m, h or d (e.g. 5m)"
+      value=${BASH_REMATCH[1]} suffix=${BASH_REMATCH[2]}
+      seconds=$((10#$value))
+      case $suffix in m) seconds=$((seconds * 60)) ;; h) seconds=$((seconds * 3600)) ;; d) seconds=$((seconds * 86400)) ;; esac
+      [ "$seconds" -gt 0 ] && [ "$seconds" -le 2147483647 ] || die "schedule interval is out of range"
+      backend=cron
+      if command -v systemctl >/dev/null && systemctl --user show-environment >/dev/null 2>&1; then backend=systemd; fi
+      if [ "$backend" = cron ]; then
+        command -v crontab >/dev/null || die "neither a systemd user manager nor crontab is available"
+        if [ "$seconds" -lt 3600 ] && [ $((seconds % 60)) -eq 0 ] && [ $((3600 % seconds)) -eq 0 ]; then
+          expression="*/$((seconds / 60)) * * * *"
+        elif [ "$seconds" -le 86400 ] && [ $((seconds % 3600)) -eq 0 ] && [ $((86400 % seconds)) -eq 0 ]; then
+          if [ "$seconds" = 86400 ]; then expression="0 0 * * *"; else expression="0 */$((seconds / 3600)) * * *"; fi
+        else die "cron interval must divide one hour in whole minutes, or one day in whole hours"; fi
+      fi
+      resolve
+      schedule_remove
+      mkdir -p "$SDIR"
+      # %q generates Bash arguments; the runner restores the interactive installation's environment.
+      runner="$SDIR/tick.sh"
+      {
+        echo '#!/usr/bin/env bash'
+        printf 'exec env HOME=%q XDG_CONFIG_HOME=%q XDG_STATE_HOME=%q PATH=%q %q --inbox %q --as %q schedule tick >/dev/null 2>&1\n' \
+          "$HOME" "${XDG_CONFIG_HOME:-$HOME/.config}" "${XDG_STATE_HOME:-$HOME/.local/state}" "$PATH" "$SELF" "$INBOX" "$ME"
+      } > "$runner"
+      chmod 700 "$runner"
+      jq -nc --arg b "$backend" --argjson s "$seconds" --arg n "$F_notify" \
+        '{backend:$b, seconds:$s, notify:$n}' > "$SDIR/config.json.tmp"
+      chmod 600 "$SDIR/config.json.tmp"
+      mv "$SDIR/config.json.tmp" "$SDIR/config.json"
+      if [ "$backend" = systemd ]; then
+        mkdir -p "$UDIR"
+        data=${runner//\\/\\\\}; data=${data//\"/\\\"}; data=${data//%/%%}
+        printf '[Unit]\nDescription=Parley unread notification\n[Service]\nType=oneshot\nExecStart=/bin/bash "%s"\n' "$data" > "$UDIR/$UNIT.service"
+        printf '[Unit]\nDescription=Parley unread heartbeat\n[Timer]\nOnActiveSec=%ss\nOnUnitActiveSec=%ss\n[Install]\nWantedBy=timers.target\n' "$seconds" "$seconds" > "$UDIR/$UNIT.timer"
+        systemctl --user daemon-reload >/dev/null
+        systemctl --user enable --now "$UNIT.timer" >/dev/null
+      else
+        printf -v data '%q' "$runner"; data=${data//%/\\%}
+        { cron_without_schedule; printf '%s /bin/bash %s >/dev/null 2>&1 %s\n' "$expression" "$data" "$TAG"; } | crontab -
+      fi
+      echo "schedule $INBOX as $ME: installed $backend every ${seconds}s" ;;
+    tick)
+      [ -f "$SDIR/config.json" ] || return 0
+      # flock releases on crashes too; systemd also serializes its oneshot service.
+      if command -v flock >/dev/null; then
+        exec 9>"$SDIR/tick.lock"
+        flock -n 9 || return 0
+      fi
+      "$SELF" --inbox "$INBOX" --as "$ME" sync --no-commit --json >/dev/null 2>&1 || return 1
+      data=$("$SELF" --inbox "$INBOX" --as "$ME" list --unread --json 2>/dev/null) || return 1
+      data=$(jq -r 'map("#\(.number) unread from \(.unreadFrom // "?"): \(.subject | gsub("[\\r\\n\\t]"; " "))") | join("; ")' <<<"$data")
+      if [ -n "$data" ]; then
+        PARLEY_UNREAD="$data" bash -c "$(jq -r .notify "$SDIR/config.json")" <<<"$data" >/dev/null 2>&1 || return 1
+      fi
+      "$SELF" --inbox "$INBOX" --as "$ME" sync --commit >/dev/null 2>&1 ;;
+    *) die "unknown schedule action '$action' (see parley-axi schedule --help)" ;;
+  esac
+}
+
 while [ $# -gt 0 ]; do
   case $1 in
     ""|-h|--help|help) help_for main; exit 0 ;;
@@ -555,6 +743,6 @@ done
 [ $# -gt 0 ] || { help_for main; exit 0; }
 cmd=$1; shift
 case $cmd in
-  init|setup|inboxes|send|list|show|reply|ack|done|decline|reopen|sync) "cmd_$cmd" "$@" ;;
+  init|setup|inboxes|send|list|show|reply|ack|done|decline|reopen|sync|schedule) "cmd_$cmd" "$@" ;;
   *) die "unknown command '$cmd' (see parley-axi --help)" ;;
 esac

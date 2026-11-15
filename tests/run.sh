@@ -6,7 +6,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 export STUB_DIR="$tmp/gh" STUB_LOG="$tmp/gh.log" PATH="$root/tests/stub:$PATH"
 export XDG_CONFIG_HOME="$tmp/config" XDG_STATE_HOME="$tmp/state"
-unset PARLEY_INBOX PARLEY_INTERVAL PARLEY_AXI PARLEY_OVERLAP PARLEY_CRASH_AT STUB_SYSTEMCTL STUB_READ_RACE
+unset PARLEY_INBOX PARLEY_INTERVAL PARLEY_AXI PARLEY_OVERLAP PARLEY_CRASH_AT STUB_SYSTEMCTL STUB_READ_RACE STUB_TOUCH_LABELS
 export HOME="$tmp/home"
 mkdir -p "$HOME"
 mkdir -p "$STUB_DIR"
@@ -172,6 +172,7 @@ echo '[]' > "$team.issues.json"; run list; expect "list empty" '[[ $out == "no m
   rest 43 open 2026-11-05T10:00:00Z 0 "Unread for them" to:bob from:alice status:open unread:bob; } | inbox "$team"
 "$px" show 40 >/dev/null
 jq '.comments[0].author.login = "bob-gh"' "$team.issue-41.json" > "$tmp/reply.json"; mv "$tmp/reply.json" "$team.issue-41.json"
+"$px" sync --no-commit >/dev/null
 run list --unread --json
 expect "list --unread includes incoming and sent threads, even closed" '[[ $rc == 0 ]] && jq -e "[.[].number] | sort == [41,42]" <<<"$out" >/dev/null' "$out"
 expect "JSON exposes per-member unread state" '[[ $rc == 0 ]] && jq -e "all(.[]; .unread == [\"alice\"])" <<<"$out" >/dev/null' "$out"
@@ -270,6 +271,7 @@ run show 30 --json
 expect "show --json retains other member unread status" '[[ $rc == 0 ]] && jq -e "[.labels[].name] | index(\"unread:bob\") != null and index(\"unread:alice\") == null" <<<"$out" >/dev/null' "$out"
 jq '[{number:30,title:"Review the PR",state:"open",comments:1,created_at:.createdAt,updated_at:.createdAt,html_url:.url,labels:.labels}]' "$team.issue-30.json" > "$team.issues.json"
 reset; STUB_READ_RACE=1 run --as bob show 30
+"$px" --as bob sync --no-commit >/dev/null
 run --as bob list --unread --json
 expect "show preserves unread when content changes while reading" '[[ $rc == 0 ]] && logged "--add-label unread:bob"' "$(cat "$STUB_LOG")"
 (bash "$px" --as bob show 30 >&-) 2>/dev/null; rc=$?
@@ -300,9 +302,9 @@ fresh; reset; run sync
 expect "first sync delivers open messages to me" '[[ $rc == 0 && $(wc -l <<<"$out") -eq 2 && $out == *"#7 new from:bob open \"Review the PR\" https://x/7"* && $out == *"#8 new from:bob acknowledged"* ]]' "$out"
 expect "first sync treats closed messages as history" '[[ $out != *"#9"* && $(jq -r ".versions[\"9\"].status" "$st/state.json") == done ]]'
 expect "first sync reads everything, all pages" '! logged "since=" && logged "--paginate" && logged "per_page=100"'
-expect "cursor is the newest server timestamp" '[[ $(cursor) == 2026-11-05T10:01:00Z ]]'
+expect "cursor covers both incoming and sent server activity" '[[ $(cursor) == 2026-11-05T10:02:00Z ]]'
 reset; run sync; expect "nothing new, nothing printed twice" '[[ $out == "no new messages" ]]' "$out"
-expect "next sync re-reads an overlap window before the cursor" 'logged "since=2026-11-05T09:51:00Z"' "$(cat "$STUB_LOG")"
+expect "next sync re-reads an overlap window before the cursor" 'logged "since=2026-11-05T09:52:00Z"' "$(cat "$STUB_LOG")"
 { rest 7 open 2026-11-05T11:00:00Z 2 "Review the PR" to:alice from:bob status:open
   rest 8 closed 2026-11-05T11:01:00Z 0 "Second ask" to:alice from:bob status:done
   rest 14 open 2026-11-05T11:02:00Z 0 "Edited" to:alice from:bob status:open; } | inbox "$team"
@@ -377,7 +379,9 @@ unseal; out=$(bash "$chk"); expect "check repeats until unread is cleared, even 
 "$px" show 7 >/dev/null; "$px" show 8 >/dev/null
 list_json 2026-11-05T11:00:00Z 1; unseal; out=$(bash "$chk")
 expect "check ignores self-authored updates without unread-to-me" '[[ -z $out ]]' "$out"
-for n in 7 8; do jq '.comments += [{id:"bob-reply",author:{login:"bob-gh"},createdAt:"2026-11-05T12:00:00Z",body:"Incoming reply"}]' "$team.issue-$n.json" > "$tmp/unread.json"; mv "$tmp/unread.json" "$team.issue-$n.json"; done
+for n in 7 8; do jq --arg id "bob-reply-$n" '.updatedAt = "2026-11-05T11:01:00Z" | .comments += [{id:$id,author:{login:"bob-gh"},createdAt:"2026-11-05T12:00:00Z",body:"Incoming reply"}]' "$team.issue-$n.json" > "$tmp/unread.json"; mv "$tmp/unread.json" "$team.issue-$n.json"; done
+jq 'map(.updated_at = "2026-11-05T11:01:00Z" | .comments = 2)' "$team.issues.json" > "$tmp/unread.json"; mv "$tmp/unread.json" "$team.issues.json"
+"$px" sync >/dev/null
 unseal; out=$(bash "$chk")
 expect "check reports unread comments even with no new sync event" '[[ $out == *"2 unread message(s)"* ]]' "$out"
 list_json 2026-11-05T12:00:00Z 2
@@ -388,6 +392,7 @@ expect "check is silent and exits 0 when gh fails" '[[ $rc == 0 && -z $out ]]' "
 unseal; (bash "$chk" >&-) 2>/dev/null; rc=$?
 expect "check exits 0 when it cannot print" '[[ $rc == 0 ]]'
 unseal; out=$(bash "$chk"); expect "check delivers what a failure held back" '[[ $out == *"2 unread message(s)"* ]]' "$out"
+"$px" show 7 >/dev/null; "$px" show 8 >/dev/null
 echo '[]' > "$team.issues.json"; unseal; out=$(bash "$chk"); expect "check is silent with no messages" '[[ -z $out ]]'
 rest 5 open 2026-11-05T10:00:00Z 0 "Ops ask" for/alice by/carol state/new unseen/alice | inbox "$ops"
 jq '.author.login = "carol-gh"' "$team.issue-5.json" > "$ops.issue-5.json"
@@ -419,7 +424,7 @@ rm -f "$tmp/notifications"
 list_json 2026-11-05T13:00:00Z 3
 "$px" show 7 >/dev/null; "$px" show 8 >/dev/null
 out=$(bash "$runner" 2>&1); rc=$?
-expect "tick syncs but is silent and does not notify without unread" '[[ $rc == 0 && -z $out && ! -e "$tmp/notifications" ]] && logged "issues?labels=to%3Aalice"' "$out"
+expect "tick syncs but is silent and does not notify without unread" '[[ $rc == 0 && -z $out && ! -e "$tmp/notifications" ]] && logged "issues?state=all"' "$out"
 { rest 50 closed 2026-11-05T14:00:00Z 1 $'Reply\nwith a newline' to:bob from:alice status:done unread:alice
   rest 51 open 2026-11-05T14:00:00Z 0 "Read already" to:alice from:bob status:open; } | inbox "$team"
 jq '.comments[0].author.login = "bob-gh"' "$team.issue-50.json" > "$tmp/reply.json"; mv "$tmp/reply.json" "$team.issue-50.json"

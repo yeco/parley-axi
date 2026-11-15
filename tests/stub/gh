@@ -19,6 +19,19 @@ done
 slug=${repo/\//__}
 emit() { if [ -n "$jqf" ]; then jq -r "$jqf"; else cat; fi; }
 field() { local f; for f in ${fields[@]+"${fields[@]}"}; do [[ $f == "$1="* ]] && echo "${f#*=}"; done; }
+touch_issue() {
+  local f="$STUB_DIR/$slug.issue-$3.json" t
+  [ -f "$f" ] || return 0
+  t=$(mktemp "$f.XXXXXX")
+  jq '.updatedAt = ((.updatedAt // "2026-11-05T10:00:00Z" | fromdateiso8601) + 1 | todateiso8601)' "$f" > "$t" && mv "$t" "$f"
+  if [ -f "$STUB_DIR/$slug.issues.json" ]; then
+    t=$(mktemp "$STUB_DIR/$slug.issues.json.XXXXXX")
+    jq --argjson n "$3" --slurpfile issue "$f" 'map(if .number == $n then
+      .updated_at = $issue[0].updatedAt | .comments = ($issue[0].comments // [] | length) |
+      .state = ($issue[0].state | ascii_downcase) | .labels = $issue[0].labels
+      else . end)' "$STUB_DIR/$slug.issues.json" > "$t" && mv "$t" "$STUB_DIR/$slug.issues.json"
+  fi
+}
 case "$1 $2" in
   "auth token") [ -z "${STUB_NO_AUTH:-}" ] || exit 1; echo tok ;;
   "api user") echo '{"login":"'"${STUB_LOGIN:-alice-gh}"'"}' | emit ;;
@@ -36,17 +49,16 @@ case "$1 $2" in
         else
           f="$STUB_DIR/$slug.issue-$n.json"
           if [ ! -f "$f" ]; then echo "missing issue $n" >&2; exit 1; fi
-          jq --arg id "issue-$slug-$n" --argjson n "$n" '.id //= $id | .number //= $n |
+          view=$(jq --arg id "issue-$slug-$n" --argjson n "$n" '.id //= $id | .number //= $n |
             .author //= {login:"bob-gh"} | .body //= "" | .title //= "Message" |
             .createdAt //= "2026-11-05T10:00:00Z" | .updatedAt //= .createdAt | .url //= "https://x" |
-            .comments //= [] | .comments |= (to_entries | map(.value + {id:(.value.id // ($id + "-comment-" + (.key|tostring)))}))' "$f" > "$f.tmp"
-          mv "$f.tmp" "$f"
+            .comments //= [] | .comments |= (to_entries | map(.value + {id:(.value.id // ($id + "-comment-" + (.key|tostring)))}))' "$f")
           if [[ $query == *timelineItems* ]]; then
-            jq '{data:{repository:{issue:{timelineItems:{nodes:(.timeline // [])}}}}}' "$f" | emit
+            jq '{data:{repository:{issue:{timelineItems:{nodes:(.timeline // [])}}}}}' <<<"$view" | emit
           elif [[ $query == *userContentEdits* ]]; then
-            jq '{data:{repository:{issue:(del(.comments) | . + {labels:{nodes:.labels},userContentEdits:{nodes:(.edits // [])}})}}}' "$f" | emit
+            jq '{data:{repository:{issue:(del(.comments) | . + {labels:{nodes:.labels},userContentEdits:{nodes:(.edits // [])}})}}}' <<<"$view" | emit
           else
-            jq '{data:{repository:{issue:{comments:{nodes:[.comments[]? | {id}]}}}}}' "$f" | emit
+            jq '{data:{repository:{issue:{comments:{nodes:[.comments[]? | {id}]}}}}}' <<<"$view" | emit
           fi
         fi ;;
       */contents/.parley.json)
@@ -66,7 +78,7 @@ case "$1 $2" in
           case $p in labels=*) label=$v ;; state=*) state=$v ;; since=*) since=$v ;; esac
         done
         jq -c --arg l "$label" --arg s "$state" --arg t "$since" '
-          map(select(any(.labels[]; .name == $l) and ($s == "all" or .state == $s) and ($t == "" or .updated_at >= $t)))
+          map(select(($l == "" or any(.labels[]; .name == $l)) and ($s == "all" or .state == $s) and ($t == "" or .updated_at >= $t)))
           | sort_by(.updated_at) | if length == 0 then [] else range(0; length; 100) as $i | .[$i:$i + 100] end' \
           "$STUB_DIR/$slug.issues.json" | if [[ " $* " == *" --paginate "* ]]; then cat; else head -n 1; fi | emit ;;
       */git/ref/heads/*) echo '{"object":{"sha":"abc123"}}' | emit ;;
@@ -82,11 +94,12 @@ case "$1 $2" in
   "issue view")
     f="$STUB_DIR/$slug.issue-$3.json"
     [ -f "$f" ] || { echo "GraphQL: Could not resolve to an Issue with the number of $3." >&2; exit 1; }
+    t=$(mktemp "$f.XXXXXX")
     jq --arg id "issue-$slug-$3" --argjson n "$3" '.id //= $id | .number //= $n |
       .author //= {login:"bob-gh"} | .body //= "" | .title //= "Message" |
       .createdAt //= "2026-11-05T10:00:00Z" | .updatedAt //= .createdAt | .url //= "https://x" |
-      .comments //= [] | .comments |= (to_entries | map(.value + {id:(.value.id // ($id + "-comment-" + (.key|tostring)))}))' "$f" > "$f.tmp"
-    mv "$f.tmp" "$f"
+      .comments //= [] | .comments |= (to_entries | map(.value + {id:(.value.id // ($id + "-comment-" + (.key|tostring)))}))' "$f" > "$t"
+    mv "$t" "$f"
     emit < "$f" ;;
   "issue edit")
     f="$STUB_DIR/$slug.issue-$3.json"
@@ -104,8 +117,10 @@ case "$1 $2" in
           {id:($id + .),__typename:"LabeledEvent",actor:{login:$actor},label:{name:.}}])' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
       if [ -n "${STUB_READ_RACE:-}" ] && [ "$remove" != '[]' ]; then
         jq --arg actor "${STUB_RACE_ACTOR:-alice-gh}" '.comments += [{id:"race-comment", author:{login:$actor}, createdAt:"2026-11-05T12:00:00Z", body:"A concurrent update"}]' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+        touch_issue "$@"
       fi
     fi
+    if [ -n "${STUB_TOUCH_LABELS:-}" ]; then touch_issue "$@"; fi
     if [ -f "$STUB_DIR/$slug.issues.json" ]; then
       jq --argjson n "$3" --argjson a "$add" --argjson r "$remove" 'map(if .number == $n then
         .labels = (([.labels[].name] + $a | unique) - $r | map({name:.})) else . end)' \
@@ -120,6 +135,7 @@ case "$1 $2" in
     if [ -f "$f" ]; then
       jq --arg body "$body" --arg actor "${STUB_LOGIN:-alice-gh}" --arg id "comment-$RANDOM-$RANDOM" \
         '.comments = ((.comments // []) + [{id:$id,body:$body,author:{login:$actor},createdAt:"2026-11-05T12:00:00Z"}])' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+      touch_issue "$@"
     fi ;;
   "issue close"|"issue reopen")
     f="$STUB_DIR/$slug.issue-$3.json"
@@ -128,6 +144,7 @@ case "$1 $2" in
     if [ -f "$f" ]; then
       jq --arg state "$state" --arg event "$event" --arg actor "${STUB_LOGIN:-alice-gh}" --arg id "event-$RANDOM-$RANDOM" \
         '.state = $state | .timeline = ((.timeline // []) + [{id:$id,__typename:$event,actor:{login:$actor}}])' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+      touch_issue "$@"
     fi ;;
   *) echo "stub gh: unhandled: $*" >&2; exit 2 ;;
 esac

@@ -68,14 +68,15 @@ unread. Receipts live beside the sync cursor in
 `$XDG_STATE_HOME/parley-axi/<inbox>/<member>/read.json`; keep this state to preserve read history.
 A new client without receipts treats other-author history as unread, including closed threads.
 
-At sync and `list --unread`, the reader reconciles their own `unread:<member>` label as a visible
+At sync and `show`, the reader reconciles their own `unread:<member>` label as a visible
 projection of that computation. Labels are created on demand; writers never set other readers'
 labels. The sender can inspect the recipient's last published read state with `list --sent` or
 `show`. Projection can lag until the recipient next syncs. `show` publishes after recording its
 receipt and preserves the other party's label; its JSON is the printed snapshot before receipt.
 
-`list --unread`, the check and heartbeat all use the same computation. Neither syncing nor
-notifying marks anything read. `ack` remains lifecycle acknowledgement, not a read receipt.
+`list --unread` reads the stored result from the latest sync/show without GitHub calls; run
+`sync` first to refresh it. The check and heartbeat sync once, then reuse that same result.
+Neither syncing nor notifying marks anything read. `ack` remains lifecycle acknowledgement, not a read receipt.
 Reading does not change status.
 
 ### Delivery (on the receiving side)
@@ -84,14 +85,22 @@ Reading does not change status.
 new comments, a status change, or an edit. It keeps a durable local cursor in
 `$XDG_STATE_HOME/parley-axi/<inbox>/<member>/` and works like this:
 
-1. **Fetch** every message to you updated since the cursor minus an overlap window
+1. **Fetch** updated issues in one paginated repository list query since the cursor minus an overlap window
    (`PARLEY_OVERLAP`, default 600 seconds), following every page. The overlap catches messages
-   GitHub indexes late. The cursor is the newest server timestamp seen, so your own clock never
-   matters, and it never moves backward.
+   GitHub indexes late. Filter locally for incoming and sent threads, including closed ones.
+   The cursor uses server timestamps, never your local clock, and never moves backward.
+   Only threads newer than their stored last-seen version need content/activity queries.
+   Their versions and reusable unread results live in `activity.json` beside `state.json`;
+   an unchanged tick makes one list query and no thread-history queries.
 2. **Compare** each message's `updatedAt` with the version last delivered. Only newer versions
-   count, so a stale read neither hides nor replays anything.
+   count, so a stale read neither hides nor replays anything. Delivery events remain recipient-only.
 3. **Write pending** (`pending.json`), then **emit** the events, then **commit** them to `state.json`
    with an atomic rename.
+
+Local state initialization, receipt merges, reconciliation, and delivery commits share a
+`flock` lock per inbox/member. Receipts and cached results use uniquely named temporary files
+and atomic replacement, so concurrent readers preserve each other's receipts. State locks
+release when the owning process exits, including on crashes.
 
 A crash or a failed fetch at any step leaves `state.json` as it was, so the next sync delivers the
 same events again. Once a sync commits, nothing repeats. The first sync delivers open messages only;
@@ -112,14 +121,15 @@ changes nothing and exits 1 when it finds a problem.
 npm i -g parley-axi
 ```
 
-Needs bash, [jq](https://jqlang.org) and an authenticated [gh](https://cli.github.com). The check
+Needs bash, [jq](https://jqlang.org), `flock`, and an authenticated [gh](https://cli.github.com). The check
 then lives at `"$(npm root -g)/parley-axi/checks/parley.check.sh"`. Without npm, use the git
 install below.
 
 ## Install from git and join an inbox
 
-Needs bash 3.2+, git, [jq](https://jqlang.org) and an authenticated [gh](https://cli.github.com)
-(`gh auth login`). Paste this, with your inbox repo and member id:
+Needs bash 3.2+, git, [jq](https://jqlang.org), `flock`, and an authenticated [gh](https://cli.github.com)
+(`gh auth login`). Linux commonly provides `flock` through util-linux; other platforms need
+a compatible `flock` command on PATH. Paste this, with your inbox repo and member id:
 
 ```bash
 # 1. Install
@@ -253,7 +263,7 @@ color), run `init` again to sync the labels.
 | `members[].id` | yes | Short id used in commands and labels. Letters, digits, `.`, `_`, `-`. Unique. |
 | `members[].github` | yes | The member's GitHub login. `setup` warns when your `gh` login differs. |
 | `members[].name` | no | Display name, used in label descriptions. Defaults to the id. |
-| `labels.to`, `labels.from`, `labels.status`, `labels.unread` | no | Label prefixes. Defaults `to:`, `from:`, `status:`, `unread:`. Must differ. |
+| `labels.to`, `labels.from`, `labels.status`, `labels.unread` | no | Label prefixes. Defaults `to:`, `from:`, `status:`, `unread:`. Must differ and never be prefixes of one another. |
 | `labels.statuses` | no | Label value for each of the four states. Defaults are the state names. |
 | `labels.colors` | no | Hex color per prefix kind (`to`, `from`, `status`, `unread`), with or without `#`. |
 

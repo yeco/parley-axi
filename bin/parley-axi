@@ -256,7 +256,9 @@ fetch_issues() {
 crashpoint() { [ "${PARLEY_CRASH_AT:-}" != "$1" ] || exit 70; }
 cmd_init() {
   parse init "--repo --member --direct" "$@"
-  [ ${#POS[@]} -eq 0 ] && [ -n "$F_repo" ] || die "usage: parley-axi init --repo <owner/name> (see --help)"
+  if [ ${#POS[@]} -ne 0 ] || [ -z "$F_repo" ]; then
+    die "usage: parley-axi init --repo <owner/name> (see --help)"
+  fi
   check_repo "$F_repo"
   REPO=$F_repo
   require_gh
@@ -300,7 +302,9 @@ cmd_init() {
 
 cmd_setup() {
   parse setup "--repo --name --default" "$@"
-  [ ${#POS[@]} -eq 0 ] && [ -n "$F_repo" ] && [ -n "$F_as" ] || die "usage: parley-axi setup --repo <owner/name> --as <member-id> (see --help)"
+  if [ ${#POS[@]} -ne 0 ] || [ -z "$F_repo" ] || [ -z "$F_as" ]; then
+    die "usage: parley-axi setup --repo <owner/name> --as <member-id> (see --help)"
+  fi
   check_repo "$F_repo"
   REPO=$F_repo ME=$F_as
   local name=${F_name:-${F_repo#*/}} have missing login want

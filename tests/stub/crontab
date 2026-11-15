@@ -2,7 +2,15 @@
 # Never touch the host crontab.
 printf '%s\n' "crontab $*" >> "$STUB_LOG"
 case $1 in
-  -l) [ -z "${STUB_CRON_READ_FAIL:-}" ] || { echo "permission denied" >&2; exit 1; }; [ -f "$STUB_DIR/crontab" ] || { echo "no crontab for test" >&2; exit 1; }; cat "$STUB_DIR/crontab" ;;
+  -l)
+    [ -z "${STUB_CRON_READ_FAIL:-}" ] || { echo "permission denied" >&2; exit 1; }
+    [ -f "$STUB_DIR/crontab" ] || { echo "no crontab for test" >&2; exit 1; }
+    table=$(cat "$STUB_DIR/crontab")
+    if [ -n "${STUB_CRON_HOLD:-}" ]; then
+      : > "$STUB_DIR/read-$STUB_CRON_HOLD"
+      while [ ! -f "$STUB_DIR/release-$STUB_CRON_HOLD" ]; do sleep 0.02; done
+    fi
+    printf '%s\n' "$table" ;;
   -) cat > "$STUB_DIR/crontab.tmp" && mv "$STUB_DIR/crontab.tmp" "$STUB_DIR/crontab" ;;
   *) exit 2 ;;
 esac

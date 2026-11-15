@@ -6,7 +6,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 export STUB_DIR="$tmp/gh" STUB_LOG="$tmp/gh.log" PATH="$root/tests/stub:$PATH"
 export XDG_CONFIG_HOME="$tmp/config" XDG_STATE_HOME="$tmp/state"
-unset PARLEY_INBOX PARLEY_INTERVAL PARLEY_AXI PARLEY_OVERLAP PARLEY_CRASH_AT STUB_SYSTEMCTL STUB_READ_RACE STUB_TOUCH_LABELS
+unset PARLEY_INBOX PARLEY_INTERVAL PARLEY_AXI PARLEY_OVERLAP PARLEY_CRASH_AT STUB_SYSTEMCTL STUB_READ_RACE STUB_TOUCH_LABELS STUB_EDIT_FAIL STUB_SAME_SECOND STUB_CRON_HOLD
 export HOME="$tmp/home"
 mkdir -p "$HOME"
 mkdir -p "$STUB_DIR"
@@ -34,7 +34,7 @@ rest() {
   local n=$1 s=$2 u=$3 c=$4 t=$5; shift 5
   local record
   record=$(jq -nc --argjson n "$n" --arg s "$s" --arg u "$u" --argjson c "$c" --arg t "$t" --arg now "$now" --args \
-    '{number:$n, title:$t, state:$s, comments:$c, created_at:$now, updated_at:$u, html_url:"https://x/\($n)", labels:[$ARGS.positional[]|{name:.}]}' "$@")
+    '{number:$n, title:$t, body:"", state:$s, comments:$c, created_at:$now, updated_at:$u, html_url:"https://x/\($n)", labels:[$ARGS.positional[]|{name:.}]}' "$@")
   jq --arg id "issue-acme__team-parley-$n" '. + {id:$id,body:"",state:(.state|ascii_upcase),createdAt:.created_at,updatedAt:.updated_at,url:.html_url,
     author:{login:(([.labels[].name | select(startswith("from:")) | ltrimstr("from:")][0] // "bob") + "-gh")},
     comments:[range(0;.comments) | {id:($id + "-comment-" + tostring),author:{login:"alice-gh"},createdAt:"2026-11-05T11:00:00Z",body:"Reply"}]}' \
@@ -291,7 +291,7 @@ issue "$team" 13 OPEN to:bob from:bob status:open
 run reply 13 hi; expect "reply on a stranger's thread fails" '[[ $rc != 0 && $out == *"not you"* ]]'
 
 # --- delivery: sync keeps a cursor and per-message versions, and delivers at least once
-st="$XDG_STATE_HOME/parley-axi/team-parley/alice"
+st="$XDG_STATE_HOME/parley-axi/team-parley/alice/acme:team-parley"
 fresh() { rm -rf "$st"; }
 cursor() { jq -r .cursor "$st/state.json"; }
 { rest 7 open 2026-11-05T10:00:00Z 0 "Review the PR" to:alice from:bob status:open

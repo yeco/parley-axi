@@ -20,14 +20,15 @@ slug=${repo/\//__}
 emit() { if [ -n "$jqf" ]; then jq -r "$jqf"; else cat; fi; }
 field() { local f; for f in ${fields[@]+"${fields[@]}"}; do [[ $f == "$1="* ]] && echo "${f#*=}"; done; }
 touch_issue() {
-  local f="$STUB_DIR/$slug.issue-$3.json" t
+  local f="$STUB_DIR/$slug.issue-$3.json" t seconds=1
   [ -f "$f" ] || return 0
   t=$(mktemp "$f.XXXXXX")
-  jq '.updatedAt = ((.updatedAt // "2026-11-05T10:00:00Z" | fromdateiso8601) + 1 | todateiso8601)' "$f" > "$t" && mv "$t" "$f"
+  if [ -n "${STUB_SAME_SECOND:-}" ]; then seconds=0; fi
+  jq --argjson seconds "$seconds" '.updatedAt = ((.updatedAt // "2026-11-05T10:00:00Z" | fromdateiso8601) + $seconds | todateiso8601)' "$f" > "$t" && mv "$t" "$f"
   if [ -f "$STUB_DIR/$slug.issues.json" ]; then
     t=$(mktemp "$STUB_DIR/$slug.issues.json.XXXXXX")
     jq --argjson n "$3" --slurpfile issue "$f" 'map(if .number == $n then
-      .updated_at = $issue[0].updatedAt | .comments = ($issue[0].comments // [] | length) |
+      .updated_at = $issue[0].updatedAt | .body = ($issue[0].body // "") | .title = $issue[0].title | .comments = ($issue[0].comments // [] | length) |
       .state = ($issue[0].state | ascii_downcase) | .labels = $issue[0].labels
       else . end)' "$STUB_DIR/$slug.issues.json" > "$t" && mv "$t" "$STUB_DIR/$slug.issues.json"
   fi
@@ -102,6 +103,7 @@ case "$1 $2" in
     mv "$t" "$f"
     emit < "$f" ;;
   "issue edit")
+    [ -z "${STUB_EDIT_FAIL:-}" ] || { echo "label edit failed" >&2; exit 1; }
     f="$STUB_DIR/$slug.issue-$3.json"
     add='[]' remove='[]'
     for ((i = 0; i < $#; i++)); do

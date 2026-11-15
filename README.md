@@ -65,14 +65,19 @@ for you nor clears unseen activity from others. Only the sender and recipient ar
 `show <n>` prints a content snapshot, including with `--json`, then durably records exactly the
 other-author activity represented in that snapshot. Concurrent activity not printed remains
 unread. Receipts live beside the sync cursor in
-`$XDG_STATE_HOME/parley-axi/<inbox>/<member>/read.json`; keep this state to preserve read history.
-A new client without receipts treats other-author history as unread, including closed threads.
+`$XDG_STATE_HOME/parley-axi/<inbox>/<member>/<owner>:<repo>/read.json`; keep this state to preserve read history.
+Repository names are case-normalized in the state path. Reassigning an inbox alias to another
+repository selects separate receipts, activity, pending delivery, and cursors; switching back
+reuses that repository's state. A new repository without receipts treats other-author history
+as unread, including closed threads.
 
 At sync and `show`, the reader reconciles their own `unread:<member>` label as a visible
 projection of that computation. Labels are created on demand; writers never set other readers'
 labels. The sender can inspect the recipient's last published read state with `list --sent` or
 `show`. Projection can lag until the recipient next syncs. `show` publishes after recording its
 receipt and preserves the other party's label; its JSON is the printed snapshot before receipt.
+The local receipt remains authoritative if label publication fails: cached listing immediately
+reflects the read, and the next sync retries the mismatched projection without rereading history.
 
 `list --unread` reads the stored result from the latest sync/show without GitHub calls; run
 `sync` first to refresh it. The check and heartbeat sync once, then reuse that same result.
@@ -83,22 +88,25 @@ Reading does not change status.
 
 `parley-axi sync` delivers every message addressed to you that is new or changed: a new message,
 new comments, a status change, or an edit. It keeps a durable local cursor in
-`$XDG_STATE_HOME/parley-axi/<inbox>/<member>/` and works like this:
+`$XDG_STATE_HOME/parley-axi/<inbox>/<member>/<owner>:<repo>/` and works like this:
 
 1. **Fetch** updated issues in one paginated repository list query since the cursor minus an overlap window
    (`PARLEY_OVERLAP`, default 600 seconds), following every page. The overlap catches messages
    GitHub indexes late. Filter locally for incoming and sent threads, including closed ones.
    The cursor uses server timestamps, never your local clock, and never moves backward.
-   Only threads newer than their stored last-seen version need content/activity queries.
+   Compare timestamps and observable source fields (subject, body, parties, status, issue state,
+   and comment count), so updates within the same second are not mistaken for unchanged content.
+   Only changed threads need content/activity queries. Raw updates also revoke cached membership
+   when you cease to be a party, before recipient-only delivery events are selected.
    Their versions and reusable unread results live in `activity.json` beside `state.json`;
    an unchanged tick makes one list query and no thread-history queries.
-2. **Compare** each message's `updatedAt` with the version last delivered. Only newer versions
-   count, so a stale read neither hides nor replays anything. Delivery events remain recipient-only.
+2. **Compare** each message's source version with the last delivered version. Timestamp ties
+   compare the same observable fields; older timestamps neither hide nor replay updates. Delivery events remain recipient-only.
 3. **Write pending** (`pending.json`), then **emit** the events, then **commit** them to `state.json`
    with an atomic rename.
 
 Local state initialization, receipt merges, reconciliation, and delivery commits share a
-`flock` lock per inbox/member. Receipts and cached results use uniquely named temporary files
+`flock` lock per inbox/member/repository. Receipts and cached results use uniquely named temporary files
 and atomic replacement, so concurrent readers preserve each other's receipts. State locks
 release when the owning process exits, including on crashes.
 
@@ -164,6 +172,9 @@ parley-axi schedule remove
 The client installs a **systemd user timer** when a user manager is available, otherwise one
 **crontab entry**. Each inbox/member gets its own schedule (`--inbox` and `--as` work as usual).
 Reinstalling replaces that schedule; removing it preserves other inboxes and unrelated cron jobs.
+Install/remove transactions share one local scheduler lock across inboxes and members, so their
+complete cron reads and replacements cannot overwrite each other's schedules. The complete cron
+table must be read successfully before any replacement is invoked.
 Status and removal work offline. The timer uses the CLI path and HOME, PATH and XDG directories
 from installation, so reinstall after moving the client or changing its environment. A systemd
 user timer runs while your user manager is running (typically while logged in); continuous

@@ -273,9 +273,13 @@ set_status() {
 
 # JQ_NORM: turns a REST issue into a message. status is the lifecycle state, or none/conflict/unknown when the labels are broken.
 # shellcheck disable=SC2016 # jq variables
-JQ_NORM='def lab($p): [.labels[] | select(startswith($p)) | ltrimstr($p)];
+JQ_NORM='def version: {updatedAt, subject, from, to, status, state, comments, body};
+  def newer($old): $old == null or .updatedAt > $old.updatedAt or
+    (.updatedAt == $old.updatedAt and version != ($old | version));
+  def party($me): .from != null and .to != null and (.to == $me or .from == $me);
+  def lab($p): [.labels[] | select(startswith($p)) | ltrimstr($p)];
   def norm($l): ($l.statuses | to_entries | map({key: .value, value: .key}) | from_entries) as $roles |
-    {number, subject: .title, from: (lab($l.from) | first), to: (lab($l.to) | first),
+    {number, subject: .title, body, from: (lab($l.from) | first), to: (lab($l.to) | first),
      status: (lab($l.status) | if length == 1 then ($roles[.[0]] // "unknown") elif length == 0 then "none" else "conflict" end),
      unread: lab($l.unread), unreadFrom: (if (lab($l.from) | first) == $me then (lab($l.to) | first) else (lab($l.from) | first) end), state, comments, createdAt: .created_at, updatedAt: .updated_at, url: .html_url};'
 
@@ -284,7 +288,7 @@ fetch_issues() {
   local q
   q="${1:+labels=$(jq -rn --arg l "$1" '$l | @uri')&}state=$2&sort=updated&direction=asc&per_page=100${3:+&since=$3}"
   gh api --paginate "repos/$REPO/issues?$q" \
-    --jq '.[] | select(.pull_request == null) | {number, title, state, comments, created_at, updated_at, html_url, labels: [.labels[].name]}' |
+    --jq '.[] | select(.pull_request == null) | {number, title, body, state, comments, created_at, updated_at, html_url, labels: [.labels[].name]}' |
     jq -cs --arg me "$ME" --argjson l "$(jq -c .labels <<<"$CFG")" "$JQ_NORM map(norm(\$l))"
 }
 
@@ -356,15 +360,19 @@ GRAPHQL
     .comments = ($comments[0] | map(del(.activity)))' <<<"$thread"
 }
 
-reconcile_thread() {
-  local thread=$1 n unread marked
-  thread=$(jq -c --slurpfile cache "$D/activity.json" '
-    $cache[0].versions[.number | tostring] as $known |
-    if $known != null and .updatedAt < $known.updatedAt then .activity = $known.activity else . end' <<<"$thread") || return 1
-  n=$(jq -er .number <<<"$thread") || return 1
-  unread=$(jq -r --arg n "$n" --slurpfile read "$D/read.json" \
-    '(.activity - ($read[0][$n] // []) | length) > 0' <<<"$thread") || return 1
-  marked=$(jq -r --arg l "$P_UNREAD$ME" 'any(.labels[]; .name == $l)' <<<"$thread") || return 1
+thread_message() {
+  jq -c --arg me "$ME" --slurpfile cfg <(printf '%s\n' "$CFG") "$JQ_NORM
+    . as \$thread | .labels |= map(.name) | .comments = (.comments | length) |
+    .created_at = .createdAt | .updated_at = .updatedAt | .html_url = .url | .state |= ascii_downcase |
+    norm(\$cfg[0].labels) + {activity: \$thread.activity}"
+}
+
+publish_unread() {
+  local message=$1 n unread marked
+  n=$(jq -er .number <<<"$message") || return 1
+  unread=$(jq -r --arg n "$n" --slurpfile read "$D/read.json" --slurpfile cache "$D/activity.json" \
+    '(($cache[0].versions[$n].activity // []) - ($read[0][$n] // []) | length) > 0' <<<"$message") || return 1
+  marked=$(jq -r --arg me "$ME" '.unread | index($me) != null' <<<"$message") || return 1
   if [ "$unread" != "$marked" ]; then
     if [ "$unread" = true ]; then
       ensure_unread_label "$ME" || return 1
@@ -373,13 +381,12 @@ reconcile_thread() {
       gh issue edit "$n" -R "$REPO" --remove-label "$P_UNREAD$ME" >/dev/null || return 1
     fi
   fi
-  jq -c --arg l "$P_UNREAD$ME" --argjson unread "$unread" \
-    '.labels = ([.labels[] | select(.name != $l)] + if $unread then [{name:$l}] else [] end)' <<<"$thread"
 }
 
 state_lock() {
   command -v flock >/dev/null || die "flock is required for local state locking"
-  D="$STATE_DIR/$INBOX/$ME"
+  check_repo "$REPO"
+  D="$STATE_DIR/$INBOX/$ME/$(tr '[:upper:]' '[:lower:]' <<<"${REPO/\//:}")"
   mkdir -p "$D"
   exec 8>"$D/state.lock"
   flock 8
@@ -400,29 +407,42 @@ state_write() {
 }
 
 cache_thread() {
-  jq -c --slurpfile old "$D/activity.json" --arg updated "$1" --arg me "$ME" \
-    --slurpfile cfg <(printf '%s\n' "$CFG") "$JQ_NORM
-    . as \$thread | .labels |= map(.name) | .comments = (.comments | length) |
-    .created_at = .createdAt | .updated_at = .updatedAt | .html_url = .url | .state |= ascii_downcase |
-    norm(\$cfg[0].labels) as \$message | \$old[0] |
-    (\$thread.number | tostring) as \$key |
-    if .versions[\$key] != null and \$updated < .versions[\$key].updatedAt then
-      .versions[\$key].message.unread = ((.versions[\$key].message.unread - [\$me]) +
-        [\$message.unread[] | select(. == \$me)])
-    else .versions[\$key] = {updatedAt: \$updated, activity: \$thread.activity, message: \$message} end" |
+  jq -c --arg me "$ME" --slurpfile old "$D/activity.json" --slurpfile source <(printf '%s\n' "$1") "$JQ_NORM
+    . as \$thread | \$old[0] | (\$thread.number | tostring) as \$key |
+    if \$thread.updatedAt < \$source[0].updatedAt or
+      (\$thread.updatedAt == \$source[0].updatedAt and (\$thread | version) != (\$source[0] | version))
+      then error(\"issue changed while fetching details\")
+    elif .versions[\$key] != null and \$source[0].updatedAt < .versions[\$key].version.updatedAt then .
+    elif (\$thread | party(\$me) | not) then del(.versions[\$key])
+    else .versions[\$key] = {version: (\$source[0] | version), activity: \$thread.activity,
+      message: (\$thread | del(.activity, .body))} end" |
     state_write "$D/activity.json"
 }
 
 reconcile_updates() {
-  local n updated thread
-  while IFS=$'\t' read -r n updated; do
+  local n changed source thread candidates
+  jq -c --arg me "$ME" --slurpfile issues <(printf '%s\n' "$1") "$JQ_NORM
+    reduce \$issues[0][] as \$issue (.; (\$issue.number | tostring) as \$key |
+      .versions[\$key].version as \$known |
+      if (\$issue | party(\$me) | not) and (\$issue | newer(\$known)) then
+        del(.versions[\$key]) else . end)" "$D/activity.json" | state_write "$D/activity.json"
+  candidates=$(jq -r --arg me "$ME" --slurpfile old "$D/activity.json" --slurpfile read "$D/read.json" "$JQ_NORM
+    .[] | (.number | tostring) as \$key | \$old[0].versions[\$key] as \$known |
+    ((\$known.activity // []) - (\$read[0][\$key] // []) | length > 0) as \$unread |
+    (party(\$me) and newer(\$known.version)) as \$changed |
+    select(\$changed or ((.unread | index(\$me) != null) != \$unread)) |
+    [.number, \$changed] | @tsv" <<<"$1") || return 1
+  while IFS=$'\t' read -r n changed; do
     [ -n "$n" ] || continue
-    thread=$(fetch_thread "$n") || return 1
-    thread=$(reconcile_thread "$thread") || return 1
-    printf '%s\n' "$thread" | cache_thread "$updated" || return 1
-  done < <(jq -r --slurpfile old "$D/activity.json" '.[] |
-    ($old[0].versions[.number | tostring].updatedAt // "") as $seen |
-    select(.updatedAt > $seen) | [.number, .updatedAt] | @tsv' <<<"$1")
+    source=$(jq -c --argjson n "$n" '.[] | select(.number == $n)' <<<"$1") || return 1
+    if [ "$changed" = true ]; then
+      thread=$(fetch_thread "$n" | thread_message) || return 1
+      printf '%s\n' "$thread" | cache_thread "$source" || return 1
+      publish_unread "$thread" || return 1
+    else
+      publish_unread "$source" || return 1
+    fi
+  done <<<"$candidates"
   jq -c --slurpfile issues <(printf '%s\n' "$1") \
     '.cursor = ([.cursor // empty, $issues[0][].updatedAt] | max)' "$D/activity.json" |
     state_write "$D/activity.json"
@@ -555,8 +575,10 @@ cmd_list() {
   if [ -n "$F_unread" ]; then
     resolve_local
     state_lock
-    out=$(jq -c --arg me "$ME" --arg sent "$F_sent" '
-      [.versions[]?.message | select(.unread | index($me)) | select($sent == "" or .from == $me)] |
+    out=$(jq -c --arg me "$ME" --arg sent "$F_sent" --slurpfile read "$D/read.json" "$JQ_NORM"'
+      [.versions[]? | . as $thread | .message | select(party($me)) |
+        .unread = ((.unread - [$me]) + if ($thread.activity - ($read[0][.number | tostring] // []) | length) > 0 then [$me] else [] end) |
+        select(.unread | index($me)) | select($sent == "" or .from == $me)] |
       sort_by(.updatedAt, .number) | reverse' "$D/activity.json")
   else
     resolve
@@ -568,7 +590,7 @@ cmd_list() {
       || die "gh failed listing messages in $REPO"
   fi
   if [ -n "$F_sent" ]; then show=to; fi
-  if [ -n "$F_json" ]; then echo "$out"; return; fi
+  if [ -n "$F_json" ]; then jq -c 'map(del(.body))' <<<"$out"; return; fi
   out=$(jq -r --arg show "$show" '
     def age: if . < 60 then "\(.)s" elif . < 3600 then "\(./60|floor)m"
              elif . < 86400 then "\(./3600|floor)h" else "\(./86400|floor)d" end;
@@ -584,6 +606,7 @@ cmd_show() {
   need_party "${POS[0]}"
   local out rendered
   out=$(fetch_thread "${POS[0]}")
+  thread_message <<<"$out" | jq -e --arg me "$ME" "$JQ_NORM party(\$me)" >/dev/null || die "#${POS[0]} is not your message"
   if [ -n "$F_json" ]; then rendered=$(jq -c 'del(.activity)' <<<"$out"); else
   # Rendered here because gh's non-TTY --comments output drops the body.
   rendered=$(jq -r --arg to "$P_TO" --arg from "$P_FROM" --arg st "$P_ST" --arg unread "$P_UNREAD" '
@@ -597,13 +620,12 @@ cmd_show() {
   fi
   printf '%s\n' "$rendered"
   state_lock
-  local n=${POS[0]} updated
+  local n=${POS[0]}
   jq -c --arg n "$n" --slurpfile seen <(jq -c .activity <<<"$out") \
     '.[$n] = ((.[$n] // []) + $seen[0] | unique)' "$D/read.json" | state_write "$D/read.json"
-  out=$(fetch_thread "$n") || return 1
-  updated=$(jq -r .updatedAt <<<"$out")
-  out=$(reconcile_thread "$out") || return 1
-  printf '%s\n' "$out" | cache_thread "$updated"
+  out=$(fetch_thread "$n" | thread_message) || return 1
+  printf '%s\n' "$out" | cache_thread "$out"
+  publish_unread "$out"
 
 }
 
@@ -673,8 +695,8 @@ cmd_reopen() {
   transition reopen "${POS[*]:1}"
 }
 
-# Delivery state per inbox/member, in $STATE_DIR/<inbox>/<member>/:
-#   state.json    {cursor, versions: {"<n>": {updatedAt, comments, status, state}}}, the last committed delivery
+# Delivery state per inbox/member/repo, in $STATE_DIR/<inbox>/<member>/<owner>:<repo>/:
+#   state.json    {cursor, versions: {"<n>": {updatedAt, subject, from, to, status, state, comments, body}}}, the last committed delivery
 #   pending.json  the next state.json plus the events it delivers, written before any event is printed
 # A sync fetches every message updated since cursor minus PARLEY_OVERLAP, prints what changed, and only then
 # commits. A crash at any step leaves state.json as it was, so the events come again (at least once).
@@ -701,24 +723,24 @@ cmd_sync() {
   since=$(jq -nr --argjson o "$OVERLAP" --slurpfile delivered "$dir/state.json" --slurpfile activity "$dir/activity.json" '
     if $delivered[0].cursor == null or $activity[0].cursor == null then empty else
       [$delivered[0].cursor, $activity[0].cursor] | min | fromdateiso8601 - $o | todateiso8601 end')
-  issues=$(fetch_issues "" all "$since" | jq -c --arg me "$ME" 'map(select(.to == $me or .from == $me))') \
+  issues=$(fetch_issues "" all "$since") \
     || die "gh failed fetching messages from $REPO"
   reconcile_updates "$issues"
   crashpoint write-pending
   # A version only moves forward, so a stale read never hides or replays an update. The first sync
   # delivers open messages only; closed ones before it are history, not news.
-  jq -c --arg me "$ME" --slurpfile s "$dir/state.json" '
-    . as $fetched | map(select(.to == $me)) | $s[0] as $old | ($old.versions // {}) as $v | . as $all |
+  jq -c --arg me "$ME" --slurpfile s "$dir/state.json" "$JQ_NORM"'
+    . as $fetched | map(select(party($me) and .to == $me)) | $s[0] as $old | ($old.versions // {}) as $v | . as $all |
     {cursor: ([$old.cursor // empty, $fetched[].updatedAt] | max),
      versions: (reduce $all[] as $i ($v; ($i.number | tostring) as $k |
-       if .[$k] == null or $i.updatedAt > .[$k].updatedAt then .[$k] = ($i | {updatedAt, comments, status, state}) else . end)),
+       .[$k] as $known | if ($i | newer($known)) then .[$k] = ($i | version) else . end)),
      events: [$all[] | . as $i | $v[.number | tostring] as $o |
-       select(if $o == null then ($old.cursor != null or .state == "open") else .updatedAt > $o.updatedAt end) |
+       select(if $o == null then ($old.cursor != null or .state == "open") else newer($o) end) |
        . + {event: (if $o == null then "new" else "updated" end),
             changes: (if $o == null then [] else
               [(if .comments > $o.comments then "+\(.comments - $o.comments) comment(s)" else empty end),
                (if .status != $o.status then "\($o.status) -> \(.status)" else empty end),
-               (if .state != $o.state then .state else empty end)] | if length == 0 then ["edited"] else . end end)}]}' \
+               (if .state != $o.state then .state else empty end)] | if length == 0 then ["edited"] else . end end)} | del(.body)]}' \
     <<<"$issues" | state_write "$dir/pending.json"
   crashpoint emit
   if [ -n "$F_json" ]; then
@@ -735,10 +757,10 @@ cmd_sync() {
 verify() {
   local issues out
   issues=$(fetch_issues "$P_TO$ME" all) || die "gh failed fetching messages from $REPO"
-  out=$(jq -c --slurpfile s "$1/state.json" '($s[0].versions // {}) as $v | {messages: length, problems: [.[] |
+  out=$(jq -c --arg me "$ME" --slurpfile s "$1/state.json" "$JQ_NORM"' ($s[0].versions // {}) as $v | {messages: length, problems: [.[] |
     $v[.number | tostring] as $o |
     (if $o == null then "#\(.number) never surfaced: \(.status) \"\(.subject)\" \(.url)"
-     elif .updatedAt > $o.updatedAt then "#\(.number) update not surfaced: delivered \($o.updatedAt), now \(.updatedAt) \(.url)"
+     elif newer($o) then "#\(.number) update not surfaced: delivered \($o.updatedAt), now \(.updatedAt) \(.url)"
      else empty end),
     (if (.status | IN("none", "conflict", "unknown")) then "#\(.number) status labels broken (\(.status)) \(.url)"
      elif (.status | IN("open", "acknowledged")) != (.state == "open") then "#\(.number) is \(.status) but the issue is \(.state) \(.url)"
@@ -756,6 +778,13 @@ schedule_paths() {
   UNIT="parley-axi-$INBOX:$ME"
   UDIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
   TAG="# parley-axi:$INBOX:$ME"
+}
+
+schedule_lock() {
+  command -v flock >/dev/null || die "flock is required for local state locking"
+  mkdir -p "$STATE_DIR"
+  exec 7>"$STATE_DIR/schedule.lock"
+  flock 7
 }
 
 cron_read() {
@@ -802,7 +831,7 @@ cmd_schedule() {
         cron) if cron_read | grep -qF "$TAG"; then active=active; fi ;;
       esac
       echo "schedule $INBOX as $ME: $backend every ${seconds}s ($active)" ;;
-    remove) schedule_remove; echo "schedule $INBOX as $ME: removed" ;;
+    remove) schedule_lock; schedule_remove; echo "schedule $INBOX as $ME: removed" ;;
     install)
       [ -n "$F_notify" ] || die "schedule install: --notify is required"
       [[ $F_every =~ ^([0-9]{1,9})([smhd])$ ]] || die "schedule interval must be a positive integer with s, m, h or d (e.g. 5m)"
@@ -821,6 +850,7 @@ cmd_schedule() {
         else die "cron interval must divide one hour in whole minutes, or one day in whole hours"; fi
       fi
       resolve
+      schedule_lock
       if [ "$backend" = cron ]; then table=$(cron_without_schedule) || return 1; fi
       schedule_remove
       mkdir -p "$SDIR"

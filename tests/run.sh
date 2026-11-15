@@ -6,9 +6,12 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 export STUB_DIR="$tmp/gh" STUB_LOG="$tmp/gh.log" PATH="$root/tests/stub:$PATH"
 export XDG_CONFIG_HOME="$tmp/config" XDG_STATE_HOME="$tmp/state"
-unset PARLEY_INBOX PARLEY_INTERVAL PARLEY_AXI PARLEY_OVERLAP PARLEY_CRASH_AT
+unset PARLEY_INBOX PARLEY_INTERVAL PARLEY_AXI PARLEY_OVERLAP PARLEY_CRASH_AT STUB_SYSTEMCTL STUB_READ_RACE
+export HOME="$tmp/home"
+mkdir -p "$HOME"
 mkdir -p "$STUB_DIR"
 px="$root/bin/parley-axi"
+export PARLEY_AXI="$px"
 team="$STUB_DIR/acme__team-parley" ops="$STUB_DIR/acme__ops-parley"
 fails=0
 
@@ -40,7 +43,7 @@ list_json() { # <updated_at> [comments]
 
 # --- help
 run --help; expect "help lists commands" '[[ $rc == 0 && $out == *decline* && $out == *init* ]]'
-for c in init setup inboxes send list show reply ack "done" decline reopen sync; do
+for c in init setup inboxes send list show reply ack "done" decline reopen sync schedule; do
   run "$c" --help; expect "$c --help" '[[ $rc == 0 && $out == *usage:* ]]'
 done
 run "done" --help; expect "done help names either party and when to close" '[[ $rc == 0 && $out == *"Sender or recipient"* && $out == *"nothing actionable is left"* ]]' "$out"
@@ -91,7 +94,7 @@ expect "init without --member uses the gh login" 'jq -e ".members[0].id == \"dan
 # --- custom label scheme for a second inbox
 cat > "$ops.parley.json" <<'EOF'
 {"members":[{"id":"alice","github":"alice-gh"},{"id":"carol","name":"Carol","github":"carol-gh"}],
- "labels":{"to":"for/","from":"by/","status":"state/","statuses":{"open":"new","acknowledged":"seen","done":"closed","declined":"wontdo"},
+ "labels":{"to":"for/","from":"by/","status":"state/","unread":"unseen/","statuses":{"open":"new","acknowledged":"seen","done":"closed","declined":"wontdo"},
            "colors":{"to":"#000000"}}}
 EOF
 reset; run init --repo acme/ops-parley
@@ -117,11 +120,13 @@ run inboxes; expect "inboxes lists all, marks default" '[[ $out == *"team-parley
 # --- send
 reset; run send --to bob --subject "Check this" --body "Please look" --link https://example.com/pr/1 --due 2026-11-10
 expect "send prints number and url" '[[ $out == "sent #42 to bob: https://github.com/acme/team-parley/issues/42" ]]' "$out"
+expect "send makes only the recipient unread" 'logged "--label unread:bob" && ! logged "--label unread:alice" && logged "label create unread:bob"' "$(cat "$STUB_LOG")"
 for want in "--label to:bob" "--label from:alice" "--label status:open" "--title Check this" "Please look" "- https://example.com/pr/1" "Due: 2026-11-10"; do
   expect "send passes '$want'" 'logged "$want"' "$(cat "$STUB_LOG")"
 done
 run send --to bob --subject s --json; expect "send --json" '[[ $(jq -r ".number,.to" <<<"$out" | paste -sd" ") == "42 bob" ]]' "$out"
 reset; run send --to alice --subject s; expect "send to yourself works (notes, self-tests)" '[[ $rc == 0 ]] && logged "--label to:alice --label from:alice"'
+expect "self-send does not mark the author unread" '! logged "--label unread:"'
 run send --to zed --subject s; expect "send to non-member fails" '[[ $rc != 0 && $out == *"not a member"* ]]'
 run send --to bob; expect "send without subject fails" '[[ $rc != 0 && $out == *--subject* ]]'
 run send --to bob --subject s --due tomorrow; expect "send bad due fails" '[[ $rc != 0 && $out == *YYYY-MM-DD* ]]'
@@ -136,6 +141,7 @@ reset; run --as bob send --to alice --subject s; expect "--as overrides the conf
 # --- multiple inboxes
 reset; run --inbox ops send --to carol --subject s
 expect "--inbox picks the repo and its labels" '[[ $rc == 0 && $out == *acme/ops-parley* ]] && logged "issue create -R acme/ops-parley" && logged "--label for/carol --label by/alice --label state/new"' "$(cat "$STUB_LOG")"
+expect "custom unread prefix marks only recipient" 'logged "--label unseen/carol" && ! logged "--label unseen/alice"'
 reset; run send --to carol --subject s --inbox ops; expect "--inbox works after the command" '[[ $rc == 0 ]] && logged "-R acme/ops-parley"'
 reset; out=$(PARLEY_INBOX=ops "$px" send --to carol --subject s 2>&1); expect "PARLEY_INBOX picks the inbox" 'logged "-R acme/ops-parley"'
 run --inbox nope list; expect "unknown inbox fails" '[[ $rc != 0 && $out == *"unknown inbox"* ]]'
@@ -154,6 +160,15 @@ run list --json; expect "list --json is normalized" '[[ $(jq -r ".[1] | [.number
 rest 9 open 2026-11-05T10:00:00Z 0 "Broken" to:alice from:bob status:open status:done | inbox "$team"
 run list --json; expect "list --json flags broken status labels" '[[ $(jq -r ".[0].status" <<<"$out") == conflict ]]' "$out"
 echo '[]' > "$team.issues.json"; run list; expect "list empty" '[[ $out == "no messages" ]]'
+{ rest 40 open 2026-11-05T10:00:00Z 0 "Read" to:alice from:bob status:open
+  rest 41 closed 2026-11-05T10:00:00Z 1 "Unread reply" to:bob from:alice status:done unread:alice
+  rest 42 open 2026-11-05T10:00:00Z 0 "Unread ask" to:alice from:bob status:open unread:alice
+  rest 43 open 2026-11-05T10:00:00Z 0 "Unread for them" to:bob from:alice status:open unread:bob; } | inbox "$team"
+run list --unread --json
+expect "list --unread includes incoming and sent threads, even closed" '[[ $rc == 0 ]] && jq -e "[.[].number] | sort == [41,42]" <<<"$out" >/dev/null' "$out"
+expect "JSON exposes per-member unread state" '[[ $rc == 0 ]] && jq -e "all(.[]; .unread == [\"alice\"])" <<<"$out" >/dev/null' "$out"
+run list --sent --json
+expect "sender can see unread recipient in list" '[[ $rc == 0 ]] && jq -e ".[0].unread == [\"bob\"]" <<<"$out" >/dev/null' "$out"
 
 # --- message state machine: every (state, command) pair; "-" means rejected
 while read -r st cmd want; do
@@ -167,12 +182,13 @@ while read -r st cmd want; do
   expect "$st + $cmd -> $want" '[[ $rc == 0 && $out == "#20 $st -> $want" ]]' "$out"
   expect "$st + $cmd records the transition" 'logged "parley: $st -> $want by alice" && logged "<!-- parley-transition {\"v\":1,\"from\":\"$st\",\"to\":\"$want\",\"by\":\"alice\"} -->"' "$(cat "$STUB_LOG")"
   expect "$st + $cmd swaps the status label" 'logged "issue edit 20 -R acme/team-parley --add-label status:$want --remove-label status:$st"'
+  expect "$st + $cmd makes only the other party unread" 'logged "--add-label unread:bob" && ! logged "--add-label unread:alice"'
   case $want in
     done|declined) expect "$st + $cmd closes" 'logged "issue close 20" && ! logged "issue reopen"' ;;
     open) expect "$st + $cmd reopens" 'logged "issue reopen 20" && ! logged "issue close"' ;;
     *) expect "$st + $cmd keeps it open" '! logged "issue close" && ! logged "issue reopen"' ;;
   esac
-  expect "$st + $cmd writes record, then open/closed, then label" '[[ $(grep -n "issue comment" "$STUB_LOG" | cut -d: -f1) -lt $(grep -n "issue edit" "$STUB_LOG" | cut -d: -f1) ]] && ! grep -A9 "issue edit" "$STUB_LOG" | grep -qE "issue (close|reopen)"'
+  expect "$st + $cmd writes record, then open/closed, then label" '[[ $(grep -n "issue comment" "$STUB_LOG" | cut -d: -f1) -lt $(grep -n "issue edit.*--add-label status:" "$STUB_LOG" | cut -d: -f1) ]] && ! grep -A9 "issue edit.*--add-label status:" "$STUB_LOG" | grep -qE "issue (close|reopen)"'
 done <<'EOF'
 open ack acknowledged
 open done done
@@ -239,8 +255,25 @@ jq -n '{number:30, title:"Review the PR", state:"OPEN", createdAt:"2026-11-05T10
 run show 30
 expect "show renders header, body and comments" '[[ $out == *"#30 Review the PR"* && $out == *"from:bob to:alice status:open open"* && $out == *"Please look"* && $out == *"--- alice-gh 2026-11-05T11:00:00Z"* && $out == *"open -> acknowledged by alice"* ]]' "$out"
 expect "show hides the machine-readable markers" '[[ $out != *"<!--"* ]]' "$out"
-reset; "$px" show 30 --json >/dev/null; expect "show --json" 'logged "issue view 30 -R acme/team-parley --json number,title,body"'
+jq '.labels += [{name:"unread:alice"},{name:"unread:bob"}]' "$team.issue-30.json" > "$tmp/read.json"; mv "$tmp/read.json" "$team.issue-30.json"
+reset; run show 30
+expect "show clears only the reader unread after printing" '[[ $rc == 0 ]] && logged "--remove-label unread:alice" && ! logged "--remove-label unread:bob"' "$out"
+run show 30 --json
+expect "show --json retains other member unread status" '[[ $rc == 0 ]] && jq -e "[.labels[].name] | index(\"unread:bob\") != null and index(\"unread:alice\") == null" <<<"$out" >/dev/null' "$out"
+reset; STUB_READ_RACE=1 run --as bob show 30
+expect "show preserves unread when content changes while reading" '[[ $rc == 0 ]] && logged "--add-label unread:bob"' "$(cat "$STUB_LOG")"
+(bash "$px" --as bob show 30 >&-) 2>/dev/null; rc=$?
+expect "failed show output does not mark read" '[[ $rc != 0 ]] && jq -e "any(.labels[]; .name == \"unread:bob\")" "$team.issue-30.json" >/dev/null'
+jq '.body = "Please look"' "$team.issue-30.json" > "$tmp/read.json"; mv "$tmp/read.json" "$team.issue-30.json"
+jq '.labels += [{name:"unread:alice"}]' "$team.issue-30.json" > "$tmp/read.json"; mv "$tmp/read.json" "$team.issue-30.json"
+reset; "$px" show 30 --json >/dev/null; expect "show --json clears reader unread" 'logged "issue view 30 -R acme/team-parley --json number,title,body" && logged "--remove-label unread:alice"'
 reset; "$px" reply 30 hello there >/dev/null; expect "reply comments" 'logged "issue comment 30 -R acme/team-parley --body hello there"'
+expect "reply marks only the other party unread before commenting" 'logged "--add-label unread:bob" && ! logged "--add-label unread:alice" && [[ $(grep -n "issue edit" "$STUB_LOG" | head -1 | cut -d: -f1) -lt $(grep -n "issue comment" "$STUB_LOG" | cut -d: -f1) ]]'
+reset; run --as bob reply 30 response
+expect "sender reply marks the recipient unread" '[[ $rc == 0 ]] && logged "--add-label unread:alice" && ! logged "--add-label unread:bob"'
+issue "$team" 31 OPEN to:alice from:alice status:open
+reset; run reply 31 note
+expect "self-reply never marks unread" '[[ $rc == 0 ]] && ! logged "--add-label unread:"'
 reset; echo "from stdin" | "$px" reply 30 - >/dev/null; expect "reply reads stdin" 'logged "--body from stdin"'
 issue "$team" 13 OPEN to:bob from:bob status:open
 run reply 13 hi; expect "reply on a stranger's thread fails" '[[ $rc != 0 && $out == *"not you"* ]]'
@@ -326,21 +359,80 @@ run sync --commit; expect "--commit with nothing pending is a no-op" '[[ $rc == 
 chk="$root/checks/parley.check.sh"
 unseal() { rm -f "$XDG_STATE_HOME"/parley-axi/*.last-check; }
 fresh; list_json 2026-11-05T10:00:00Z
+jq 'map(.labels += [{name:"unread:alice"}])' "$team.issues.json" > "$tmp/unread.json"; mv "$tmp/unread.json" "$team.issues.json"
 out=$(bash "$chk"); rc=$?
-expect "check prints one line for new messages" '[[ $rc == 0 && $(wc -l <<<"$out") -eq 1 && $out == "parley: 2 message event(s): #7 new from bob: Review the PR; #8 new from bob: Second ask - read with: parley-axi show <n>" ]]' "$out"
+expect "check prints one line for new messages" '[[ $rc == 0 && $(wc -l <<<"$out") -eq 1 && $out == "parley: 2 unread message(s): #8 unread from bob: Second ask; #7 unread from bob: Review the PR - read with: parley-axi show <n>" ]]' "$out"
 out=$(bash "$chk"); expect "check is rate limited" '[[ -z $out ]]'
-unseal; out=$(bash "$chk"); expect "check prints nothing for delivered messages" '[[ -z $out ]]' "$out"
+unseal; out=$(bash "$chk"); expect "check repeats until unread is cleared, even after sync committed" '[[ $out == *"2 unread message(s)"* ]]' "$out"
 list_json 2026-11-05T11:00:00Z 1; unseal; out=$(bash "$chk")
-expect "check reports new comments" '[[ $out == "parley: 2 message event(s): #7 updated (+1 comment(s)) from bob: Review the PR;"* ]]' "$out"
-list_json 2026-11-05T12:00:00Z 2; unseal; out=$(STUB_GH_FAIL=1 bash "$chk" 2>&1); rc=$?
+expect "check ignores self-authored updates without unread-to-me" '[[ -z $out ]]' "$out"
+jq 'map(.labels += [{name:"unread:alice"}])' "$team.issues.json" > "$tmp/unread.json"; mv "$tmp/unread.json" "$team.issues.json"
+unseal; out=$(bash "$chk")
+expect "check reports unread comments even with no new sync event" '[[ $out == *"2 unread message(s)"* ]]' "$out"
+list_json 2026-11-05T12:00:00Z 2
+jq 'map(.labels += [{name:"unread:alice"}])' "$team.issues.json" > "$tmp/unread.json"; mv "$tmp/unread.json" "$team.issues.json"
+unseal; out=$(STUB_GH_FAIL=1 bash "$chk" 2>&1); rc=$?
 expect "check is silent and exits 0 when gh fails" '[[ $rc == 0 && -z $out ]]' "$out"
 unseal; (bash "$chk" >&-) 2>/dev/null; rc=$?
 expect "check exits 0 when it cannot print" '[[ $rc == 0 ]]'
-unseal; out=$(bash "$chk"); expect "check delivers what a failure held back" '[[ $out == "parley: 2 message event(s): #7 updated (+1 comment(s))"* ]]' "$out"
+unseal; out=$(bash "$chk"); expect "check delivers what a failure held back" '[[ $out == *"2 unread message(s)"* ]]' "$out"
 echo '[]' > "$team.issues.json"; unseal; out=$(bash "$chk"); expect "check is silent with no messages" '[[ -z $out ]]'
-rest 5 open 2026-11-05T10:00:00Z 0 "Ops ask" for/alice by/carol state/new | inbox "$ops"
-out=$(bash "$chk" ops); expect "check takes an inbox argument" '[[ $out == "parley: 1 message event(s): #5 new from carol: Ops ask - read with: parley-axi --inbox ops show <n>" ]]' "$out"
+rest 5 open 2026-11-05T10:00:00Z 0 "Ops ask" for/alice by/carol state/new unseen/alice | inbox "$ops"
+out=$(bash "$chk" ops); expect "check takes an inbox argument" '[[ $out == "parley: 1 unread message(s): #5 unread from carol: Ops ask - read with: parley-axi --inbox ops show <n>" ]]' "$out"
 out=$(XDG_CONFIG_HOME="$tmp/none" bash "$chk" other 2>&1); rc=$?
 expect "check is silent without local config" '[[ $rc == 0 && -z $out ]]' "$out"
+
+# --- self-managed heartbeat: generated scheduler output and executable tick contract
+run schedule install --as .. --every 5m --notify 'true'
+expect "schedule rejects path traversal member ids" '[[ $rc != 0 ]]' "$out"
+export STUB_SYSTEMCTL=1
+reset; run schedule install --every 5m --notify "cat >> '$tmp/notifications'"
+expect "schedule installs a systemd user timer" '[[ $rc == 0 && $out == *systemd* ]] && logged "systemctl --user enable --now parley-axi-team-parley:alice.timer"' "$out"
+timer="$XDG_CONFIG_HOME/systemd/user/parley-axi-team-parley:alice.timer"
+runner="$XDG_STATE_HOME/parley-axi/schedule/team-parley/alice/tick.sh"
+expect "systemd timer contract sets the requested interval" '[ -f "$timer" ] && grep -qx "OnUnitActiveSec=300s" "$timer" && [ -x "$runner" ]'
+run schedule status; expect "schedule status reports backend, interval and member" '[[ $rc == 0 && $out == *"systemd"* && $out == *"300s"* && $out == *"alice"* && $out == *"active"* ]]' "$out"
+rm -f "$tmp/notifications"
+list_json 2026-11-05T13:00:00Z 3
+out=$(bash "$runner" 2>&1); rc=$?
+expect "tick syncs but is silent and does not notify without unread" '[[ $rc == 0 && -z $out && ! -e "$tmp/notifications" ]] && logged "issues?labels=to%3Aalice"' "$out"
+{ rest 50 closed 2026-11-05T14:00:00Z 1 $'Reply\nwith a newline' to:bob from:alice status:done unread:alice
+  rest 51 open 2026-11-05T14:00:00Z 0 "Read already" to:alice from:bob status:open; } | inbox "$team"
+out=$(bash "$runner" 2>&1); rc=$?
+expect "tick notifies unread on sent threads with one-line summary on stdin" '[[ $rc == 0 && -z $out && $(cat "$tmp/notifications") == "#50 unread from bob: Reply with a newline" ]]' "$out"
+run schedule install --every 5m --notify "printf '%s\\n' \"\$PARLEY_UNREAD\" > '$tmp/env-notification'"
+expect "schedule reinstall succeeds" '[[ $rc == 0 ]]' "$out"
+bash "$runner"
+expect "tick passes summary in PARLEY_UNREAD too" '[[ $(cat "$tmp/env-notification") == "#50 unread from bob: Reply with a newline" ]]'
+run schedule install --every 5m --notify 'exit 1'; bash "$runner"; rc=$?
+expect "failed notification leaves sync pending for retry" '[[ $rc != 0 && -f "$st/pending.json" ]]'
+reset; STUB_GH_FAIL=1 run schedule status
+expect "schedule status works offline" '[[ $rc == 0 && $out == *systemd* ]]' "$out"
+reset; STUB_GH_FAIL=1 run schedule remove
+expect "schedule remove disables the timer and removes its files" '[[ $rc == 0 && ! -e "$timer" && ! -e "$runner" ]] && logged "systemctl --user disable --now parley-axi-team-parley:alice.timer"' "$out"
+run schedule status; expect "removed schedule is not installed" '[[ $rc == 0 && $out == *"not installed"* ]]' "$out"
+run schedule remove; expect "schedule remove is idempotent" '[[ $rc == 0 ]]' "$out"
+unset STUB_SYSTEMCTL
+echo '17 * * * * echo unrelated-job' > "$STUB_DIR/crontab"
+run schedule install --every 5m --notify "cat > '$tmp/cron-notification'"
+expect "schedule falls back to crontab" '[[ $rc == 0 && $out == *cron* ]] && grep -q "^\*/5 \* \* \* \* " "$STUB_DIR/crontab"' "$out"
+run schedule status; expect "cron status reports active" '[[ $rc == 0 && $out == *cron* && $out == *active* ]]' "$out"
+run schedule install --every 10m --notify 'true'
+expect "cron reinstall replaces only its own entry" '[[ $rc == 0 && $(grep -c "# parley-axi:team-parley:alice$" "$STUB_DIR/crontab") == 1 ]] && grep -q "^\*/10 " "$STUB_DIR/crontab" && grep -qx "17 \* \* \* \* echo unrelated-job" "$STUB_DIR/crontab"' "$out"
+run schedule install --inbox ops --every 5m --notify 'true'
+expect "another inbox has its own schedule" '[[ $rc == 0 && $(grep -c "# parley-axi:" "$STUB_DIR/crontab") == 2 ]]' "$out"
+run schedule remove
+expect "cron removal preserves other inbox and unrelated entries" '[[ $rc == 0 ]] && ! grep -q "# parley-axi:team-parley:alice$" "$STUB_DIR/crontab" && grep -q "# parley-axi:ops:alice$" "$STUB_DIR/crontab" && grep -q unrelated-job "$STUB_DIR/crontab"' "$out"
+run schedule remove --inbox ops
+for interval in 0 nope 7m 30s; do
+  run schedule install --every "$interval" --notify 'true'
+  expect "cron rejects unsupported interval $interval" '[[ $rc != 0 && $out == *interval* ]]' "$out"
+done
+run schedule install --every 5m
+expect "schedule install requires notify command" '[[ $rc != 0 && $out == *notify* ]]' "$out"
+rm -f "$STUB_DIR/crontab"
+run schedule install --every 1h --notify 'true'
+expect "cron install works with an empty crontab" '[[ $rc == 0 ]] && grep -q "^0 \*/1 \* \* \* " "$STUB_DIR/crontab"' "$out"
+run schedule remove
 
 echo; [ "$fails" = 0 ] && echo "all passed" || { echo "$fails failed"; exit 1; }

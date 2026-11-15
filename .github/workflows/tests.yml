@@ -11,5 +11,5 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - run: shellcheck bin/parley-axi checks/*.sh tests/run.sh tests/stub/gh
+      - run: shellcheck bin/parley-axi checks/*.sh tests/run.sh tests/stub/*
       - run: bash tests/run.sh

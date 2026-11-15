@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Never touch the host crontab.
+printf '%s\n' "crontab $*" >> "$STUB_LOG"
+case $1 in
+  -l) [ -f "$STUB_DIR/crontab" ] || { echo "no crontab for test" >&2; exit 1; }; cat "$STUB_DIR/crontab" ;;
+  -) cat > "$STUB_DIR/crontab.tmp" && mv "$STUB_DIR/crontab.tmp" "$STUB_DIR/crontab" ;;
+  *) exit 2 ;;
+esac

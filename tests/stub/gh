@@ -57,6 +57,21 @@ case "$1 $2" in
     f="$STUB_DIR/$slug.issue-$3.json"
     [ -f "$f" ] || { echo "GraphQL: Could not resolve to an Issue with the number of $3." >&2; exit 1; }
     emit < "$f" ;;
-  "issue edit"|"issue comment"|"issue close"|"issue reopen") ;;
+  "issue edit")
+    f="$STUB_DIR/$slug.issue-$3.json"
+    add='[]' remove='[]'
+    for ((i = 0; i < $#; i++)); do
+      case ${args[i]} in
+        --add-label) add=$(jq -nc --argjson a "$add" --arg l "${args[i + 1]}" '$a + [$l]') ;;
+        --remove-label) remove=$(jq -nc --argjson a "$remove" --arg l "${args[i + 1]}" '$a + [$l]') ;;
+      esac
+    done
+    if [ -f "$f" ]; then
+      jq --argjson a "$add" --argjson r "$remove" '.labels = (([.labels[].name] + $a | unique) - $r | map({name:.}))' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+      if [ -n "${STUB_READ_RACE:-}" ] && [ "$remove" != '[]' ]; then
+        jq '.body = "A concurrent update"' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+      fi
+    fi ;;
+  "issue comment"|"issue close"|"issue reopen") ;;
   *) echo "stub gh: unhandled: $*" >&2; exit 2 ;;
 esac

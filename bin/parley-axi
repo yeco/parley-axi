@@ -47,13 +47,14 @@ usage: parley-axi list [--all] [--sent] [--unread] [--json]
 Default: open messages addressed to you. --sent: messages you sent. --all: include closed ones.
 --unread: cached unread from the latest sync/show, including sent and closed threads; does not mark read.
 Run sync to refresh unread before listing; unread listing itself makes no GitHub calls.
+Only new messages, new comments and other-party status transitions mark unread; edits do not.
 Unread labels in list/show tell the sender who has not read the latest activity.
 Lines: #number from:<who> <status> <age> "subject" url   (--sent shows to:<who>)
 --json: [{number,subject,from,to,status,unread,unreadFrom,state,comments,createdAt,updatedAt,url}], newest update first.
 status is the lifecycle state (open, acknowledged, done, declined), or none/conflict/unknown when the labels are broken.
 EOF
     ;;
-    show) echo "usage: parley-axi show <n> [--json]   Prints the message header, body and comments, then clears your unread marker. Sender or recipient only." ;;
+    show) echo "usage: parley-axi show <n> [--json]   Prints the message header, body and comments, then clears your unread marker. Edits do not mark unread. Sender or recipient only." ;;
     reply) echo "usage: parley-axi reply <n> <text>|-   Adds a comment; the other party detects unread activity on sync. '-' reads stdin. Sender or recipient only." ;;
     ack) echo "usage: parley-axi ack <n>   Recipient only. open -> acknowledged." ;;
     done) echo "usage: parley-axi done <n> [note]   Sender or recipient. open|acknowledged -> done, closes the issue. Either party should mark done when nothing actionable is left: the question answered and applied, or the request fulfilled." ;;
@@ -75,7 +76,7 @@ EOF
 usage: parley-axi sync [--json] [--no-commit] | sync --commit | sync --verify [--json]
 Delivers every message to you that is new or changed since the last sync (new message, new comments,
 status change, edit), at least once. One list query; only changed threads need unread detail queries.
-Stores unread results for list --unread, check and heartbeat. One line per event, or --json: [{...message, event, changes}].
+Edits can be delivered but do not mark unread. Stores unread results for list --unread, check and heartbeat. One line per event, or --json: [{...message, event, changes}].
 --no-commit prints the events but keeps them pending; sync --commit marks them delivered. Use the pair
 when something else has to show the events first, so a crash in between delivers them again.
 --verify compares the local delivery state with the repo and lists any message never surfaced and any
@@ -293,19 +294,18 @@ fetch_issues() {
 }
 
 fetch_thread() {
-  local n=$1 pages thread comments ids id part timeline login
+  local n=$1 thread comments timeline login
   login=$(jq -r --arg me "$ME" '.members[] | select(.id == $me) | .github | ascii_downcase' <<<"$CFG")
   timeline=$(gh api graphql --paginate -f owner="${REPO%/*}" -f name="${REPO#*/}" -F number="$n" -f query="$(cat <<'GRAPHQL'
     query($owner:String!, $name:String!, $number:Int!, $endCursor:String) {
       repository(owner:$owner,name:$name) { issue(number:$number) {
-        timelineItems(first:100,after:$endCursor,itemTypes:[CLOSED_EVENT,REOPENED_EVENT,LABELED_EVENT,UNLABELED_EVENT,RENAMED_TITLE_EVENT]) {
+        timelineItems(first:100,after:$endCursor,itemTypes:[CLOSED_EVENT,REOPENED_EVENT,LABELED_EVENT,UNLABELED_EVENT]) {
           pageInfo { hasNextPage endCursor } nodes {
             __typename
             ... on ClosedEvent { id actor { login } }
             ... on ReopenedEvent { id actor { login } }
             ... on LabeledEvent { id actor { login } label { name } }
             ... on UnlabeledEvent { id actor { login } label { name } }
-            ... on RenamedTitleEvent { id actor { login } }
           }
         }
       } }
@@ -313,51 +313,31 @@ fetch_thread() {
 GRAPHQL
 )" | jq -cs --arg st "$P_ST" '[.[].data.repository.issue.timelineItems.nodes[] |
       select(.label == null or (.label.name | startswith($st))) | {id, actor: .actor.login}]') || return 1
-  pages=$(gh api graphql --paginate -f owner="${REPO%/*}" -f name="${REPO#*/}" -F number="$n" -f query="$(cat <<'GRAPHQL'
-    query($owner:String!, $name:String!, $number:Int!, $endCursor:String) {
+  thread=$(gh api graphql -f owner="${REPO%/*}" -f name="${REPO#*/}" -F number="$n" -f query="$(cat <<'GRAPHQL'
+    query($owner:String!, $name:String!, $number:Int!) {
       repository(owner:$owner,name:$name) { issue(number:$number) {
         id number title body state createdAt updatedAt url author { login }
         labels(first:100) { nodes { name } }
-        userContentEdits(first:100,after:$endCursor) {
-          pageInfo { hasNextPage endCursor } nodes { id editor { login } }
-        }
       } }
     }
 GRAPHQL
-)") || return 1
-  thread=$(jq -ces '[.[].data.repository.issue] as $pages | $pages[-1] |
-    select(.id != null) | .labels = .labels.nodes |
-    .activity = ([{id, actor: .author.login}] + [$pages[].userContentEdits.nodes[] | {id, actor: .editor.login}]) |
-    del(.userContentEdits)' <<<"$pages") || return 1
-  ids=$(gh api graphql --paginate -f owner="${REPO%/*}" -f name="${REPO#*/}" -F number="$n" -f query="$(cat <<'GRAPHQL'
+)" | jq -ce '.data.repository.issue | select(.id != null) | .labels = .labels.nodes |
+    .activity = [{id, actor: .author.login}]') || return 1
+  comments=$(gh api graphql --paginate -f owner="${REPO%/*}" -f name="${REPO#*/}" -F number="$n" -f query="$(cat <<'GRAPHQL'
     query($owner:String!, $name:String!, $number:Int!, $endCursor:String) {
       repository(owner:$owner,name:$name) { issue(number:$number) {
-        comments(first:100,after:$endCursor) { pageInfo { hasNextPage endCursor } nodes { id } }
+        comments(first:100,after:$endCursor) {
+          pageInfo { hasNextPage endCursor }
+          nodes { id body createdAt updatedAt author { login } }
+        }
       } }
     }
 GRAPHQL
-)" | jq -r '.data.repository.issue.comments.nodes[].id') || return 1
-  comments='[]'
-  while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    pages=$(gh api graphql --paginate -f id="$id" -f query="$(cat <<'GRAPHQL'
-      query($id:ID!, $endCursor:String) { node(id:$id) { ... on IssueComment {
-        id body createdAt updatedAt author { login }
-        userContentEdits(first:100,after:$endCursor) {
-          pageInfo { hasNextPage endCursor } nodes { id editor { login } }
-        }
-      } } }
-GRAPHQL
-)") || return 1
-    part=$(jq -ces '[.[].data.node] as $pages | $pages[-1] | select(.id != null) |
-      .activity = ([{id, actor: .author.login}] + [$pages[].userContentEdits.nodes[] | {id, actor: .editor.login}]) |
-      del(.userContentEdits)' <<<"$pages") || return 1
-    comments=$(printf '%s\n' "$comments" "$part" | jq -cs '.[0] + [.[1]]') || return 1
-  done <<<"$ids"
+)" | jq -cs '[.[].data.repository.issue.comments.nodes[]]') || return 1
   jq -c --slurpfile comments <(printf '%s\n' "$comments") --slurpfile timeline <(printf '%s\n' "$timeline") --arg login "$login" '
-    .activity = ([.activity[], $comments[0][].activity[], $timeline[0][]] |
+    .activity = ([.activity[], ($comments[0][] | {id, actor: .author.login}), $timeline[0][]] |
       map(select((.actor // "" | ascii_downcase) != $login) | .id) | unique) |
-    .comments = ($comments[0] | map(del(.activity)))' <<<"$thread"
+    .comments = $comments[0]' <<<"$thread"
 }
 
 thread_message() {
@@ -381,6 +361,10 @@ publish_unread() {
       gh issue edit "$n" -R "$REPO" --remove-label "$P_UNREAD$ME" >/dev/null || return 1
     fi
   fi
+  jq -c --arg n "$n" --arg me "$ME" --argjson unread "$unread" '
+    if .versions[$n] != null then .versions[$n].message.unread |=
+      ((. - [$me]) + if $unread then [$me] else [] end) else . end' "$D/activity.json" |
+    state_write "$D/activity.json"
 }
 
 state_lock() {
@@ -442,6 +426,13 @@ reconcile_updates() {
     else
       publish_unread "$source" || return 1
     fi
+  done <<<"$candidates"
+  candidates=$(jq -c --arg me "$ME" --slurpfile read "$D/read.json" '
+    .versions[]? | select(((.activity - ($read[0][.message.number | tostring] // []) | length) > 0) !=
+      (.message.unread | index($me) != null)) | .message' "$D/activity.json") || return 1
+  while IFS= read -r source; do
+    [ -n "$source" ] || continue
+    publish_unread "$source" || return 1
   done <<<"$candidates"
   jq -c --slurpfile issues <(printf '%s\n' "$1") \
     '.cursor = ([.cursor // empty, $issues[0][].updatedAt] | max)' "$D/activity.json" |

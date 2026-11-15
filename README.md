@@ -57,8 +57,9 @@ Every transition is recorded in the repo, so the history can be rebuilt from the
 ### Read receipts (independent of lifecycle and delivery)
 
 Each reader computes unread from activity by other GitHub authors that is absent from their
-local read receipt. This includes new messages, comments, body and comment edits, title changes,
-status-label changes, and close/reopen events made through either Parley or GitHub. Incoming and
+local read receipt. Only new messages, new comments (including replies and transition comments),
+status-label changes, and close/reopen transitions made through either Parley or GitHub trigger unread.
+Edits to existing bodies, titles, or comments do not mark unread. Incoming and
 sent threads are checked, including closed ones. Your own activity neither makes a thread unread
 for you nor clears unseen activity from others. Only the sender and recipient are notified.
 
@@ -77,7 +78,9 @@ labels. The sender can inspect the recipient's last published read state with `l
 `show`. Projection can lag until the recipient next syncs. `show` publishes after recording its
 receipt and preserves the other party's label; its JSON is the printed snapshot before receipt.
 The local receipt remains authoritative if label publication fails: cached listing immediately
-reflects the read, and the next sync retries the mismatched projection without rereading history.
+reflects the read, and the next sync retries the mismatched projection without rereading history,
+even when that cached thread is older than the incremental query's overlap window. Successful
+publication updates the cached projection so an unchanged sync does not republish it.
 
 `list --unread` reads the stored result from the latest sync/show without GitHub calls; run
 `sync` first to refresh it. The check and heartbeat sync once, then reuse that same result.
@@ -87,7 +90,8 @@ Reading does not change status.
 ### Delivery (on the receiving side)
 
 `parley-axi sync` delivers every message addressed to you that is new or changed: a new message,
-new comments, a status change, or an edit. It keeps a durable local cursor in
+new comments, a status change, or an edit. Edit delivery is independent of unread: edits to existing
+content can be delivered by sync without triggering a check or heartbeat notification. It keeps a durable local cursor in
 `$XDG_STATE_HOME/parley-axi/<inbox>/<member>/<owner>:<repo>/` and works like this:
 
 1. **Fetch** updated issues in one paginated repository list query since the cursor minus an overlap window

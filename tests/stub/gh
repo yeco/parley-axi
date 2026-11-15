@@ -3,6 +3,7 @@
 #   <slug>.parley.json (contents API), <slug>.labels (one per line), <slug>.pr (open init PR url),
 #   <slug>.issues.json (REST issues: filtered by labels, state and since, in pages of 100; only the first without --paginate), <slug>.issue-<n>.json (view).
 # STUB_NO_AUTH and STUB_GH_FAIL simulate a logged-out gh and a network failure.
+set -o pipefail
 printf '%s\n' "$*" >> "$STUB_LOG"
 [ -z "${STUB_GH_FAIL:-}" ] || { echo "error connecting to api.github.com" >&2; exit 1; }
 repo="" jqf="" path="" fields=()
@@ -11,7 +12,7 @@ for ((i = 0; i < $#; i++)); do
   case ${args[i]} in
     -R) repo=${args[i + 1]} ;;
     --jq) jqf=${args[i + 1]} ;;
-    -f) fields+=("${args[i + 1]}") ;;
+    -f|-F) fields+=("${args[i + 1]}") ;;
     repos/*) path=${args[i]}; repo=$(cut -d/ -f2-3 <<<"$path") ;;
   esac
 done
@@ -23,6 +24,31 @@ case "$1 $2" in
   "api user") echo '{"login":"'"${STUB_LOGIN:-alice-gh}"'"}' | emit ;;
   api\ *)
     case $path in
+      "")
+        if [[ " $* " != *" graphql "* ]]; then exit 2; fi
+        owner=$(field owner); name=$(field name); n=$(field number); node_id=$(field id)
+        query=$(field query)
+        repo="$owner/$name"; slug=${repo/\//__}
+        if [ -n "$node_id" ]; then
+          f=$(grep -lF -- "$node_id" "$STUB_DIR"/*.issue-*.json | head -1)
+          jq --arg id "$node_id" '{data:{node:(.comments[] | select(.id == $id) |
+            . + {userContentEdits:{nodes:(.edits // [])}})}}' "$f" | emit
+        else
+          f="$STUB_DIR/$slug.issue-$n.json"
+          if [ ! -f "$f" ]; then echo "missing issue $n" >&2; exit 1; fi
+          jq --arg id "issue-$slug-$n" --argjson n "$n" '.id //= $id | .number //= $n |
+            .author //= {login:"bob-gh"} | .body //= "" | .title //= "Message" |
+            .createdAt //= "2026-11-05T10:00:00Z" | .updatedAt //= .createdAt | .url //= "https://x" |
+            .comments //= [] | .comments |= (to_entries | map(.value + {id:(.value.id // ($id + "-comment-" + (.key|tostring)))}))' "$f" > "$f.tmp"
+          mv "$f.tmp" "$f"
+          if [[ $query == *timelineItems* ]]; then
+            jq '{data:{repository:{issue:{timelineItems:{nodes:(.timeline // [])}}}}}' "$f" | emit
+          elif [[ $query == *userContentEdits* ]]; then
+            jq '{data:{repository:{issue:(del(.comments) | . + {labels:{nodes:.labels},userContentEdits:{nodes:(.edits // [])}})}}}' "$f" | emit
+          else
+            jq '{data:{repository:{issue:{comments:{nodes:[.comments[]? | {id}]}}}}}' "$f" | emit
+          fi
+        fi ;;
       */contents/.parley.json)
         if [[ " $* " == *" -X PUT "* ]]; then
           field content | base64 -d > "$STUB_DIR/$slug.put.json"
@@ -56,6 +82,11 @@ case "$1 $2" in
   "issue view")
     f="$STUB_DIR/$slug.issue-$3.json"
     [ -f "$f" ] || { echo "GraphQL: Could not resolve to an Issue with the number of $3." >&2; exit 1; }
+    jq --arg id "issue-$slug-$3" --argjson n "$3" '.id //= $id | .number //= $n |
+      .author //= {login:"bob-gh"} | .body //= "" | .title //= "Message" |
+      .createdAt //= "2026-11-05T10:00:00Z" | .updatedAt //= .createdAt | .url //= "https://x" |
+      .comments //= [] | .comments |= (to_entries | map(.value + {id:(.value.id // ($id + "-comment-" + (.key|tostring)))}))' "$f" > "$f.tmp"
+    mv "$f.tmp" "$f"
     emit < "$f" ;;
   "issue edit")
     f="$STUB_DIR/$slug.issue-$3.json"
@@ -68,10 +99,35 @@ case "$1 $2" in
     done
     if [ -f "$f" ]; then
       jq --argjson a "$add" --argjson r "$remove" '.labels = (([.labels[].name] + $a | unique) - $r | map({name:.}))' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+      jq --argjson a "$add" --argjson r "$remove" --arg actor "${STUB_LOGIN:-alice-gh}" --arg id "label-$RANDOM-$RANDOM" \
+        '.timeline = ((.timeline // []) + [($a + $r)[] | select(startswith("status:") or startswith("state/")) |
+          {id:($id + .),__typename:"LabeledEvent",actor:{login:$actor},label:{name:.}}])' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
       if [ -n "${STUB_READ_RACE:-}" ] && [ "$remove" != '[]' ]; then
-        jq '.body = "A concurrent update"' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+        jq --arg actor "${STUB_RACE_ACTOR:-alice-gh}" '.comments += [{id:"race-comment", author:{login:$actor}, createdAt:"2026-11-05T12:00:00Z", body:"A concurrent update"}]' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
       fi
+    fi
+    if [ -f "$STUB_DIR/$slug.issues.json" ]; then
+      jq --argjson n "$3" --argjson a "$add" --argjson r "$remove" 'map(if .number == $n then
+        .labels = (([.labels[].name] + $a | unique) - $r | map({name:.})) else . end)' \
+        "$STUB_DIR/$slug.issues.json" > "$STUB_DIR/$slug.issues.json.tmp" && mv "$STUB_DIR/$slug.issues.json.tmp" "$STUB_DIR/$slug.issues.json"
     fi ;;
-  "issue comment"|"issue close"|"issue reopen") ;;
+  "issue comment")
+    f="$STUB_DIR/$slug.issue-$3.json"
+    body=""
+    for ((i = 0; i < $#; i++)); do
+      if [ "${args[i]}" = --body ]; then body=${args[i + 1]}; fi
+    done
+    if [ -f "$f" ]; then
+      jq --arg body "$body" --arg actor "${STUB_LOGIN:-alice-gh}" --arg id "comment-$RANDOM-$RANDOM" \
+        '.comments = ((.comments // []) + [{id:$id,body:$body,author:{login:$actor},createdAt:"2026-11-05T12:00:00Z"}])' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+    fi ;;
+  "issue close"|"issue reopen")
+    f="$STUB_DIR/$slug.issue-$3.json"
+    state=OPEN; event=ReopenedEvent
+    if [ "$2" = close ]; then state=CLOSED; event=ClosedEvent; fi
+    if [ -f "$f" ]; then
+      jq --arg state "$state" --arg event "$event" --arg actor "${STUB_LOGIN:-alice-gh}" --arg id "event-$RANDOM-$RANDOM" \
+        '.state = $state | .timeline = ((.timeline // []) + [{id:$id,__typename:$event,actor:{login:$actor}}])' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+    fi ;;
   *) echo "stub gh: unhandled: $*" >&2; exit 2 ;;
 esac

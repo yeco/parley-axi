@@ -38,8 +38,8 @@ EOF
     inboxes) echo "usage: parley-axi inboxes [--json]   Lists the configured inboxes: name repo member (* marks the default)." ;;
     send) cat <<'EOF'
 usage: parley-axi send --to <member-id> --subject <s> [--body <text>|--body-file <file|->] [--link <url>]... [--due YYYY-MM-DD] [--json]
-Creates one issue labelled with to, from, open-status, and unread for the recipient (never for yourself).
-Unread labels are created on demand. Body text comes first, then links and due date.
+Creates one issue labelled with to, from and open-status. Readers reconcile unread labels.
+Body text comes first, then links and due date.
 EOF
     ;;
     list) cat <<'EOF'
@@ -53,7 +53,7 @@ status is the lifecycle state (open, acknowledged, done, declined), or none/conf
 EOF
     ;;
     show) echo "usage: parley-axi show <n> [--json]   Prints the message header, body and comments, then clears your unread marker. Sender or recipient only." ;;
-    reply) echo "usage: parley-axi reply <n> <text>|-   Adds a comment and marks it unread for the other party. '-' reads stdin. Sender or recipient only." ;;
+    reply) echo "usage: parley-axi reply <n> <text>|-   Adds a comment; the other party detects unread activity on sync. '-' reads stdin. Sender or recipient only." ;;
     ack) echo "usage: parley-axi ack <n>   Recipient only. open -> acknowledged." ;;
     done) echo "usage: parley-axi done <n> [note]   Sender or recipient. open|acknowledged -> done, closes the issue. Either party should mark done when nothing actionable is left: the question answered and applied, or the request fulfilled." ;;
     decline) echo "usage: parley-axi decline <n> <reason>   Recipient only. open|acknowledged -> declined, closes the issue." ;;
@@ -65,7 +65,7 @@ Installs a systemd user timer where available, otherwise a crontab entry, for th
 --every: positive integer with s, m, h or d (default 5m). Cron supports intervals dividing an hour
 in whole minutes, or a day in whole hours (e.g. 5m, 15m, 1h, 1d).
 Each tick syncs and invokes the shell command only for unread-to-you messages, even on sent or
-closed threads. The one-line summary is passed on stdin and in PARLEY_UNREAD. No tick output.
+closed threads. The one-line summary is passed on stdin. No tick output.
 Unread repeats until show clears it. Failed notification does not commit the pending sync.
 status shows the backend and interval; remove removes only this inbox/member's schedule.
 EOF
@@ -257,25 +257,12 @@ ensure_unread_label() {
     --description "Unread for $1" --force >/dev/null
 }
 
-# Mark before posting: a failed post can leave an extra unread, but cannot hide a successful one.
-mark_other_unread() {
-  local party
-  for party in "$(label_val "$P_TO")" "$(label_val "$P_FROM")"; do
-    [ -n "$party" ] && [ "$party" != "$ME" ] || continue
-    ensure_unread_label "$party"
-    gh issue edit "$1" -R "$REPO" --add-label "$P_UNREAD$party" >/dev/null
-  done
-}
-
 # set_status <n> <label>: leaves exactly one status label on the issue.
 set_status() {
   local args=(--add-label "$2") l
   while IFS= read -r l; do
     if [[ $l == "$P_ST"* && $l != "$2" ]]; then args+=(--remove-label "$l"); fi
   done <<<"$LABELS"
-  for l in "$(label_val "$P_TO")" "$(label_val "$P_FROM")"; do
-    if [ -n "$l" ] && [ "$l" != "$ME" ]; then args+=(--add-label "$P_UNREAD$l"); fi
-  done
   gh issue edit "$1" -R "$REPO" "${args[@]}" >/dev/null
 }
 
@@ -294,6 +281,111 @@ fetch_issues() {
   gh api --paginate "repos/$REPO/issues?$q" \
     --jq '.[] | select(.pull_request == null) | {number, title, state, comments, created_at, updated_at, html_url, labels: [.labels[].name]}' |
     jq -cs --arg me "$ME" --argjson l "$(jq -c .labels <<<"$CFG")" "$JQ_NORM map(norm(\$l))"
+}
+
+fetch_thread() {
+  local n=$1 pages thread comments ids id part timeline login
+  login=$(jq -r --arg me "$ME" '.members[] | select(.id == $me) | .github | ascii_downcase' <<<"$CFG")
+  timeline=$(gh api graphql --paginate -f owner="${REPO%/*}" -f name="${REPO#*/}" -F number="$n" -f query="$(cat <<'GRAPHQL'
+    query($owner:String!, $name:String!, $number:Int!, $endCursor:String) {
+      repository(owner:$owner,name:$name) { issue(number:$number) {
+        timelineItems(first:100,after:$endCursor,itemTypes:[CLOSED_EVENT,REOPENED_EVENT,LABELED_EVENT,UNLABELED_EVENT,RENAMED_TITLE_EVENT]) {
+          pageInfo { hasNextPage endCursor } nodes {
+            __typename
+            ... on ClosedEvent { id actor { login } }
+            ... on ReopenedEvent { id actor { login } }
+            ... on LabeledEvent { id actor { login } label { name } }
+            ... on UnlabeledEvent { id actor { login } label { name } }
+            ... on RenamedTitleEvent { id actor { login } }
+          }
+        }
+      } }
+    }
+GRAPHQL
+)" | jq -cs --arg st "$P_ST" '[.[].data.repository.issue.timelineItems.nodes[] |
+      select(.label == null or (.label.name | startswith($st))) | {id, actor: .actor.login}]') || return 1
+  pages=$(gh api graphql --paginate -f owner="${REPO%/*}" -f name="${REPO#*/}" -F number="$n" -f query="$(cat <<'GRAPHQL'
+    query($owner:String!, $name:String!, $number:Int!, $endCursor:String) {
+      repository(owner:$owner,name:$name) { issue(number:$number) {
+        id number title body state createdAt updatedAt url author { login }
+        labels(first:100) { nodes { name } }
+        userContentEdits(first:100,after:$endCursor) {
+          pageInfo { hasNextPage endCursor } nodes { id editor { login } }
+        }
+      } }
+    }
+GRAPHQL
+)") || return 1
+  thread=$(jq -ces '[.[].data.repository.issue] as $pages | $pages[-1] |
+    select(.id != null) | .labels = .labels.nodes |
+    .activity = ([{id, actor: .author.login}] + [$pages[].userContentEdits.nodes[] | {id, actor: .editor.login}]) |
+    del(.userContentEdits)' <<<"$pages") || return 1
+  ids=$(gh api graphql --paginate -f owner="${REPO%/*}" -f name="${REPO#*/}" -F number="$n" -f query="$(cat <<'GRAPHQL'
+    query($owner:String!, $name:String!, $number:Int!, $endCursor:String) {
+      repository(owner:$owner,name:$name) { issue(number:$number) {
+        comments(first:100,after:$endCursor) { pageInfo { hasNextPage endCursor } nodes { id } }
+      } }
+    }
+GRAPHQL
+)" | jq -r '.data.repository.issue.comments.nodes[].id') || return 1
+  comments='[]'
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    pages=$(gh api graphql --paginate -f id="$id" -f query="$(cat <<'GRAPHQL'
+      query($id:ID!, $endCursor:String) { node(id:$id) { ... on IssueComment {
+        id body createdAt updatedAt author { login }
+        userContentEdits(first:100,after:$endCursor) {
+          pageInfo { hasNextPage endCursor } nodes { id editor { login } }
+        }
+      } } }
+GRAPHQL
+)") || return 1
+    part=$(jq -ces '[.[].data.node] as $pages | $pages[-1] | select(.id != null) |
+      .activity = ([{id, actor: .author.login}] + [$pages[].userContentEdits.nodes[] | {id, actor: .editor.login}]) |
+      del(.userContentEdits)' <<<"$pages") || return 1
+    comments=$(jq -c --argjson part "$part" '. + [$part]' <<<"$comments") || return 1
+  done <<<"$ids"
+  jq -c --argjson comments "$comments" --argjson timeline "$timeline" --arg login "$login" '
+    .activity = ([.activity[], $comments[].activity[], $timeline[]] |
+      map(select((.actor // "" | ascii_downcase) != $login) | .id) | unique) |
+    .comments = ($comments | map(del(.activity)))' <<<"$thread"
+}
+
+reconcile_thread() {
+  local thread=$1 dir="$STATE_DIR/$INBOX/$ME" n unread marked
+  n=$(jq -er .number <<<"$thread") || return 1
+  mkdir -p "$dir" || return 1
+  if [ ! -f "$dir/read.json" ]; then echo '{}' > "$dir/read.json" || return 1; fi
+  unread=$(jq -r --arg n "$n" --slurpfile read "$dir/read.json" \
+    '(.activity - ($read[0][$n] // []) | length) > 0' <<<"$thread") || return 1
+  marked=$(jq -r --arg l "$P_UNREAD$ME" 'any(.labels[]; .name == $l)' <<<"$thread") || return 1
+  if [ "$unread" != "$marked" ]; then
+    if [ "$unread" = true ]; then
+      ensure_unread_label "$ME" || return 1
+      gh issue edit "$n" -R "$REPO" --add-label "$P_UNREAD$ME" >/dev/null || return 1
+    else
+      gh issue edit "$n" -R "$REPO" --remove-label "$P_UNREAD$ME" >/dev/null || return 1
+    fi
+  fi
+  jq -c --arg l "$P_UNREAD$ME" --argjson unread "$unread" \
+    '.labels = ([.labels[] | select(.name != $l)] + if $unread then [{name:$l}] else [] end)' <<<"$thread"
+}
+
+reconcile_unread() {
+  local issues incoming sent n thread out='[]'
+  incoming=$(fetch_issues "$P_TO$ME" all) || return 1
+  sent=$(fetch_issues "$P_FROM$ME" all) || return 1
+  issues=$(printf '%s\n' "$incoming" "$sent" | jq -cs 'add | unique_by(.number)') || return 1
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    thread=$(fetch_thread "$n") || return 1
+    thread=$(reconcile_thread "$thread") || return 1
+    thread=$(jq -c --arg me "$ME" --argjson l "$(jq -c .labels <<<"$CFG")" \
+      "$JQ_NORM .labels |= map(.name) | .comments = (.comments | length) |
+       .created_at = .createdAt | .updated_at = .updatedAt | .html_url = .url | .state |= ascii_downcase | norm(\$l)" <<<"$thread") || return 1
+    out=$(jq -c --argjson thread "$thread" '. + [$thread]' <<<"$out") || return 1
+  done <<<"$(jq -r --arg me "$ME" '.[] | select(.to == $me or .from == $me) | .number' <<<"$issues")"
+  jq -c 'sort_by(.updatedAt)' <<<"$out"
 }
 
 # crashpoint <step>: test hook that simulates a crash right before <step>.
@@ -382,7 +474,7 @@ cmd_inboxes() {
 cmd_send() {
   parse send "--to --subject --body --body-file --link --due --json" "$@"
   [ ${#POS[@]} -eq 0 ] || die "send: unexpected argument '${POS[0]}' (see parley-axi send --help)"
-  local body=$F_body parts=() msg="" p url unread=()
+  local body=$F_body parts=() msg="" p url
   resolve
   [ -n "$F_to" ] || die "send: --to is required (members: $(member_ids))"
   is_member "$F_to" || die "send: '$F_to' is not a member of $REPO (members: $(member_ids))"
@@ -407,12 +499,8 @@ cmd_send() {
   parts+=("<!-- parley-message {\"v\":1,\"from\":\"$ME\",\"to\":\"$F_to\"} -->")
   for p in "${parts[@]}"; do msg+="${msg:+$'\n\n'}$p"; done
 
-  if [ "$F_to" != "$ME" ]; then
-    ensure_unread_label "$F_to"
-    unread=(--label "$P_UNREAD$F_to")
-  fi
   url=$(gh issue create -R "$REPO" --title "$F_subject" --body "$msg" \
-    --label "$P_TO$F_to" --label "$P_FROM$ME" --label "$(status_label open)" ${unread[@]+"${unread[@]}"})
+    --label "$P_TO$F_to" --label "$P_FROM$ME" --label "$(status_label open)")
   if [ -n "$F_json" ]; then
     jq -nc --argjson n "${url##*/}" --arg u "$url" --arg t "$F_to" '{number: $n, to: $t, url: $u}'
   else
@@ -427,10 +515,14 @@ cmd_list() {
   local state=open mine=$P_TO show=from out
   if [ -n "$F_all" ]; then state=all; fi
   if [ -n "$F_sent" ]; then mine=$P_FROM show=to; fi
-  if [ -n "$F_unread" ]; then state=all; mine=$P_UNREAD; fi
-  out=$(fetch_issues "$mine$ME" "$state" | jq -c --arg me "$ME" --arg sent "$F_sent" '
-    map(select(.to == $me or .from == $me) | select($sent == "" or .from == $me)) | reverse') \
-    || die "gh failed listing messages in $REPO"
+  if [ -n "$F_unread" ]; then
+    out=$(reconcile_unread | jq -c --arg me "$ME" --arg sent "$F_sent" \
+      'map(select(.unread | index($me)) | select($sent == "" or .from == $me)) | reverse')
+  else
+    out=$(fetch_issues "$mine$ME" "$state" | jq -c --arg me "$ME" --arg sent "$F_sent" '
+      map(select(.to == $me or .from == $me) | select($sent == "" or .from == $me)) | reverse') \
+      || die "gh failed listing messages in $REPO"
+  fi
   if [ -n "$F_json" ]; then echo "$out"; return; fi
   out=$(jq -r --arg show "$show" '
     def age: if . < 60 then "\(.)s" elif . < 3600 then "\(./60|floor)m"
@@ -445,39 +537,28 @@ cmd_show() {
   resolve
   load "${POS[0]}"
   need_party "${POS[0]}"
-  local out
-  out=$(gh issue view "${POS[0]}" -R "$REPO" --json number,title,body,state,labels,author,comments,createdAt,updatedAt,url)
-  if [ -n "$F_json" ]; then echo "$out"; else
+  local out rendered
+  out=$(fetch_thread "${POS[0]}")
+  if [ -n "$F_json" ]; then rendered=$(jq -c 'del(.activity)' <<<"$out"); else
   # Rendered here because gh's non-TTY --comments output drops the body.
-  jq -r --arg to "$P_TO" --arg from "$P_FROM" --arg st "$P_ST" --arg unread "$P_UNREAD" '
+  rendered=$(jq -r --arg to "$P_TO" --arg from "$P_FROM" --arg st "$P_ST" --arg unread "$P_UNREAD" '
     def lab($p): [.labels[].name | select(startswith($p)) | ltrimstr($p)] | first // "-";
     def text: split("\n") | map(select(startswith("<!-- parley-") | not)) | join("\n") | sub("\\s+$"; "");
     "#\(.number) \(.title)",
     "from:\(lab($from)) to:\(lab($to)) status:\(lab($st)) \(.state | ascii_downcase) \(.createdAt) \(.url)",
     "unread: \([.labels[].name | select(startswith($unread)) | ltrimstr($unread)] | if length == 0 then "none" else join(", ") end)",
     "", (.body | text | select(. != "")),
-    (.comments[] | "", "--- \(.author.login) \(.createdAt)", (.body | text))' <<<"$out"
+    (.comments[] | "", "--- \(.author.login) \(.createdAt)", (.body | text))' <<<"$out")
   fi
-  # Output must succeed before read receipt. Recheck content, not updatedAt (label removal changes it).
-  local latest before after
-  if jq -e --arg l "$P_UNREAD$ME" 'any(.labels[]; .name == $l)' <<<"$out" >/dev/null; then
-    gh issue edit "${POS[0]}" -R "$REPO" --remove-label "$P_UNREAD$ME" >/dev/null
-    if ! latest=$(gh issue view "${POS[0]}" -R "$REPO" --json number,title,body,state,labels,author,comments,createdAt,updatedAt,url); then
-      ensure_unread_label "$ME"
-      gh issue edit "${POS[0]}" -R "$REPO" --add-label "$P_UNREAD$ME" >/dev/null
-      die "could not confirm read of #${POS[0]}; left unread"
-    fi
-    before=$(read_version "$out")
-    after=$(read_version "$latest")
-    if [ "$before" != "$after" ]; then
-      ensure_unread_label "$ME"
-      gh issue edit "${POS[0]}" -R "$REPO" --add-label "$P_UNREAD$ME" >/dev/null
-    fi
-  fi
-}
-
-read_version() {
-  jq -cS --arg st "$P_ST" '{title,body,comments,state,status: [.labels[].name | select(startswith($st))] | sort}' <<<"$1"
+  printf '%s\n' "$rendered"
+  local dir="$STATE_DIR/$INBOX/$ME" n=${POS[0]}
+  mkdir -p "$dir"
+  [ -f "$dir/read.json" ] || echo '{}' > "$dir/read.json"
+  jq -c --arg n "$n" --argjson seen "$(jq -c .activity <<<"$out")" \
+    '.[$n] = ((.[$n] // []) + $seen | unique)' "$dir/read.json" > "$dir/read.json.tmp"
+  mv "$dir/read.json.tmp" "$dir/read.json"
+  out=$(fetch_thread "$n") || return 1
+  reconcile_thread "$out" >/dev/null
 }
 
 cmd_reply() {
@@ -489,9 +570,7 @@ cmd_reply() {
   need_party "$n"
   if [ "$text" = - ]; then text=$(cat); fi
   [ -n "$text" ] || die "reply text is empty"
-  mark_other_unread "$n"
   gh issue comment "$n" -R "$REPO" --body "$text" >/dev/null
-  mark_other_unread "$n"
   echo "replied on #$n"
 }
 
@@ -514,9 +593,7 @@ transition() {
   esac
   body="parley: $cur -> $next by $ME"$'\n'"<!-- parley-transition {\"v\":1,\"from\":\"$cur\",\"to\":\"$next\",\"by\":\"$ME\"} -->"
   if [ -n "$note" ]; then body+=$'\n\n'"$note"; fi
-  mark_other_unread "$n"
   gh issue comment "$n" -R "$REPO" --body "$body" >/dev/null
-  mark_other_unread "$n"
   # gh prints its own success line on stderr, so keep stderr only when the call fails
   case $next:$STATE in
     done:OPEN|declined:OPEN) out=$(gh issue close "$n" -R "$REPO" 2>&1) || die "gh failed closing #$n: $out" ;;
@@ -567,11 +644,12 @@ cmd_sync() {
   parse sync "--verify --no-commit --commit --json" "$@"
   [ ${#POS[@]} -eq 0 ] || die "sync: unexpected argument '${POS[0]}' (see parley-axi sync --help)"
   resolve
-  local dir="$STATE_DIR/$INBOX" since issues out
+  local dir="$STATE_DIR/$INBOX/$ME" since issues out
   mkdir -p "$dir"
   [ -f "$dir/state.json" ] || echo '{}' > "$dir/state.json"
   if [ -n "$F_commit" ]; then commit_pending "$dir"; return; fi
   if [ -n "$F_verify" ]; then verify "$dir"; return; fi
+  reconcile_unread >/dev/null
 
   since=$(jq -r --argjson o "$OVERLAP" '.cursor // empty | fromdateiso8601 - $o | todateiso8601' "$dir/state.json")
   issues=$(fetch_issues "$P_TO$ME" all "$since") || die "gh failed fetching messages from $REPO"
@@ -637,18 +715,22 @@ cron_read() {
   fi
 }
 
-cron_without_schedule() { cron_read | awk -v tag="$TAG" 'substr($0, length($0) - length(tag) + 1) != tag'; }
+cron_without_schedule() {
+  local table
+  table=$(cron_read) || return 1
+  printf '%s\n' "$table" | awk -v tag="$TAG" 'substr($0, length($0) - length(tag) + 1) != tag'
+}
 
 schedule_remove() {
   [ -f "$SDIR/config.json" ] || return 0
-  local backend
+  local backend table
   backend=$(jq -r .backend "$SDIR/config.json")
   case $backend in
     systemd)
       systemctl --user disable --now "$UNIT.timer" >/dev/null
       rm -f "$UDIR/$UNIT.timer" "$UDIR/$UNIT.service"
       systemctl --user daemon-reload >/dev/null ;;
-    cron) cron_without_schedule | crontab - ;;
+    cron) table=$(cron_without_schedule) || return 1; printf '%s\n' "$table" | crontab - ;;
     *) die "unknown schedule backend '$backend'" ;;
   esac
   rm -f "$SDIR/config.json" "$SDIR/tick.sh"
@@ -657,7 +739,7 @@ schedule_remove() {
 cmd_schedule() {
   parse schedule "--every --notify" "$@"
   [ ${#POS[@]} -eq 1 ] || die "usage: parley-axi schedule install|status|remove|tick (see --help)"
-  local action=${POS[0]} backend seconds value suffix expression="" runner active="inactive" data
+  local action=${POS[0]} backend seconds value suffix expression="" runner active="inactive" data table
   resolve_local
   schedule_paths
   case $action in
@@ -673,7 +755,7 @@ cmd_schedule() {
     remove) schedule_remove; echo "schedule $INBOX as $ME: removed" ;;
     install)
       [ -n "$F_notify" ] || die "schedule install: --notify is required"
-      [[ $F_every =~ ^([0-9]{1,9})([smhd]?)$ ]] || die "schedule interval must be a positive integer with s, m, h or d (e.g. 5m)"
+      [[ $F_every =~ ^([0-9]{1,9})([smhd])$ ]] || die "schedule interval must be a positive integer with s, m, h or d (e.g. 5m)"
       value=${BASH_REMATCH[1]} suffix=${BASH_REMATCH[2]}
       seconds=$((10#$value))
       case $suffix in m) seconds=$((seconds * 60)) ;; h) seconds=$((seconds * 3600)) ;; d) seconds=$((seconds * 86400)) ;; esac
@@ -689,6 +771,7 @@ cmd_schedule() {
         else die "cron interval must divide one hour in whole minutes, or one day in whole hours"; fi
       fi
       resolve
+      if [ "$backend" = cron ]; then table=$(cron_without_schedule) || return 1; fi
       schedule_remove
       mkdir -p "$SDIR"
       # %q generates Bash arguments; the runner restores the interactive installation's environment.
@@ -712,7 +795,7 @@ cmd_schedule() {
         systemctl --user enable --now "$UNIT.timer" >/dev/null
       else
         printf -v data '%q' "$runner"; data=${data//%/\\%}
-        { cron_without_schedule; printf '%s /bin/bash %s >/dev/null 2>&1 %s\n' "$expression" "$data" "$TAG"; } | crontab -
+        { printf '%s\n' "$table"; printf '%s /bin/bash %s >/dev/null 2>&1 %s\n' "$expression" "$data" "$TAG"; } | crontab -
       fi
       echo "schedule $INBOX as $ME: installed $backend every ${seconds}s" ;;
     tick)
@@ -726,7 +809,7 @@ cmd_schedule() {
       data=$("$SELF" --inbox "$INBOX" --as "$ME" list --unread --json 2>/dev/null) || return 1
       data=$(jq -r 'map("#\(.number) unread from \(.unreadFrom // "?"): \(.subject | gsub("[\\r\\n\\t]"; " "))") | join("; ")' <<<"$data")
       if [ -n "$data" ]; then
-        PARLEY_UNREAD="$data" bash -c "$(jq -r .notify "$SDIR/config.json")" <<<"$data" >/dev/null 2>&1 || return 1
+        bash -c "$(jq -r .notify "$SDIR/config.json")" <<<"$data" >/dev/null 2>&1 || return 1
       fi
       "$SELF" --inbox "$INBOX" --as "$ME" sync --commit >/dev/null 2>&1 ;;
     *) die "unknown schedule action '$action' (see parley-axi schedule --help)" ;;

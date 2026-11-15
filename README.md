@@ -56,29 +56,33 @@ Every transition is recorded in the repo, so the history can be rebuilt from the
 
 ### Read receipts (independent of lifecycle and delivery)
 
-`send` marks the message unread for its recipient. `reply` and every transition mark it unread
-for the other party, whether sender or recipient. Your own activity never adds an unread marker
-for you, and it does not clear an existing one. Only the two parties are notified, not every
-member of the inbox. The labels are created on demand, so existing inbox configs keep working.
+Each reader computes unread from activity by other GitHub authors that is absent from their
+local read receipt. This includes new messages, comments, body and comment edits, title changes,
+status-label changes, and close/reopen events made through either Parley or GitHub. Incoming and
+sent threads are checked, including closed ones. Your own activity neither makes a thread unread
+for you nor clears unseen activity from others. Only the sender and recipient are notified.
 
-`show <n>` prints the message before removing your unread label, including with `--json`. It
-preserves the other party's label and restores yours if it detects content changing while you
-read. `list --unread` includes unread incoming and sent threads, even closed ones, without
-clearing anything. `list --sent` and `show` expose unread members so the sender can check whether
-the recipient has read the activity. JSON from `show` is the snapshot before clearing the label.
-An absent unread label means read; older messages without markers have no historical read receipt.
+`show <n>` prints a content snapshot, including with `--json`, then durably records exactly the
+other-author activity represented in that snapshot. Concurrent activity not printed remains
+unread. Receipts live beside the sync cursor in
+`$XDG_STATE_HOME/parley-axi/<inbox>/<member>/read.json`; keep this state to preserve read history.
+A new client without receipts treats other-author history as unread, including closed threads.
 
-Unread writes bracket comments; transitions also include the marker in their final status-label
-edit. A failed write can leave an extra unread marker, which is preferable to hiding activity.
-`ack` still means lifecycle acknowledgement, not a read receipt. Reading does not change status,
-and neither syncing nor notifying marks a message read. Posts made directly in GitHub do not
-create unread labels; use the Parley commands for unread notifications.
+At sync and `list --unread`, the reader reconciles their own `unread:<member>` label as a visible
+projection of that computation. Labels are created on demand; writers never set other readers'
+labels. The sender can inspect the recipient's last published read state with `list --sent` or
+`show`. Projection can lag until the recipient next syncs. `show` publishes after recording its
+receipt and preserves the other party's label; its JSON is the printed snapshot before receipt.
+
+`list --unread`, the check and heartbeat all use the same computation. Neither syncing nor
+notifying marks anything read. `ack` remains lifecycle acknowledgement, not a read receipt.
+Reading does not change status.
 
 ### Delivery (on the receiving side)
 
 `parley-axi sync` delivers every message addressed to you that is new or changed: a new message,
 new comments, a status change, or an edit. It keeps a durable local cursor in
-`$XDG_STATE_HOME/parley-axi/<inbox>/` and works like this:
+`$XDG_STATE_HOME/parley-axi/<inbox>/<member>/` and works like this:
 
 1. **Fetch** every message to you updated since the cursor minus an overlap window
    (`PARLEY_OVERLAP`, default 600 seconds), following every page. The overlap catches messages
@@ -94,8 +98,8 @@ same events again. Once a sync commits, nothing repeats. The first sync delivers
 closed ones from before it are history. `sync --no-commit` and `sync --commit` split emitting
 from committing for a caller that must show the events before they count as delivered. The check
 and heartbeat use that pair, committing only after successful output or notification. They select
-notifications by unread labels rather than timestamps, so self-authored updates do not wake you.
-The labels stay in the inbox even after delivery commits, and subsequent ticks retry until `show`.
+notifications by reconciled read receipts rather than delivery timestamps, so self-authored
+updates do not wake you. Unread persists after delivery commits; subsequent ticks retry until `show`.
 
 `parley-axi sync --verify` makes a missed message impossible to hide. It reads every message to you,
 compares it with the local state, and lists any message never surfaced, any update not surfaced, and
@@ -130,7 +134,7 @@ parley-axi setup --repo acme/team-parley --as alice
 parley-axi list
 
 # 4. Install a heartbeat. Replace notify-agent with your supervisor's notification command.
-#    It receives a one-line unread summary on stdin and in PARLEY_UNREAD.
+#    It receives a one-line unread summary on stdin.
 parley-axi schedule install --every 5m --notify 'notify-agent'
 
 # Or have your supervisor poll the existing check and wake on output:
@@ -155,14 +159,14 @@ from installation, so reinstall after moving the client or changing its environm
 user timer runs while your user manager is running (typically while logged in); continuous
 logged-out operation depends on the host's user-manager policy.
 
-`--every` takes an integer with `s`, `m`, `h` or `d`, or bare seconds (default `5m`). Systemd
+`--every` takes an integer with `s`, `m`, `h` or `d` (default `5m`). Systemd
 supports any positive interval in range. Cron supports whole-minute intervals dividing one hour
 (e.g. `5m`, `15m`, `30m`) or whole-hour intervals dividing one day (e.g. `1h`, `6h`, `1d`);
 unsupported intervals are rejected rather than silently changed.
 
 Each tick syncs and checks all unread-to-you threads, including replies on sent or closed
 messages. Only when unread exists does it execute your trusted `--notify` shell command, passing
-one line such as `#44 unread from bob: Review request` on **stdin** and in **`PARLEY_UNREAD`**.
+one line such as `#44 unread from bob: Review request` on **stdin**.
 Multiple messages are separated by `; ` on that same line. The tick and notification command's
 output are suppressed. A failed sync or notification leaves delivery pending for retry; successful
 notifications repeat on the next interval until the reader runs `show`. Message text is data,
@@ -311,7 +315,7 @@ what is being asked, and drafts the reply.
 ## Development
 
 ```bash
-bash tests/run.sh                                        # stubbed gh, no network
+bash tests/run.sh                                        # needs jq and Python 3; stubbed gh, no network
 shellcheck bin/parley-axi checks/*.sh tests/run.sh tests/stub/*
 ```
 

@@ -1,0 +1,227 @@
+"""CLI regressions: unread ownership and scheduler safety from the agreed design.
+
+The independent oracle is the author's unread/scheduling contract. These cases
+reject writer-dependent delivery, self-wakes, lost post-print activity, cron
+replacement on read failure, and cadence-only checks with a wrong executable.
+"""
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+
+ROOT = Path(__file__).absolute().parent.parent
+with tempfile.TemporaryDirectory(prefix="parley-review-") as tmp:
+    tmp = Path(tmp)
+    stub = tmp / "gh"
+    stub.mkdir()
+    env = {
+        **os.environ,
+        "HOME": str(tmp / "home"),
+        "XDG_CONFIG_HOME": str(tmp / "config"),
+        "XDG_STATE_HOME": str(tmp / "state"),
+        "STUB_DIR": str(stub),
+        "STUB_LOG": str(tmp / "calls"),
+        "PATH": f"{ROOT / 'tests/stub'}:{os.environ['PATH']}",
+        "PARLEY_AXI": str(ROOT / "bin/parley-axi"),
+        "PARLEY_INTERVAL": "0",
+    }
+    for key in ("PARLEY_INBOX", "PARLEY_CRASH_AT", "STUB_GH_FAIL", "STUB_SYSTEMCTL",
+                "STUB_READ_RACE", "STUB_CRON_READ_FAIL", "STUB_RACE_ACTOR"):
+        env.pop(key, None)
+    (tmp / "home").mkdir()
+    config = tmp / "config/parley-axi/config.json"
+    config.parent.mkdir(parents=True)
+    config.write_text(json.dumps({"default": "team", "inboxes": {
+        "team": {"repo": "acme/team", "member": "alice"},
+        "other": {"repo": "acme/team", "member": "alice"},
+    }}))
+    (stub / "acme__team.parley.json").write_text(json.dumps({"members": [
+        {"id": "alice", "github": "alice-gh"}, {"id": "bob", "github": "bob-gh"},
+    ]}))
+    (stub / "acme__team.labels").write_text("")
+    file = stub / "acme__team.issue-1.json"
+
+    def save(data):
+        file.write_text(json.dumps(data))
+        (stub / "acme__team.issues.json").write_text(json.dumps([{
+            "number": 1, "title": data["title"], "state": data["state"].lower(),
+            "comments": len(data["comments"]), "labels": data["labels"],
+            "created_at": data["createdAt"], "updated_at": data["updatedAt"],
+            "html_url": data["url"],
+        }]))
+
+    def fixture(sender="bob", state="OPEN", status="open"):
+        save({"id": "thread-1", "number": 1, "title": "Review request", "body": "Old body",
+              "author": {"login": sender + "-gh"}, "state": state,
+              "createdAt": "2026-11-05T10:00:00Z", "updatedAt": "2026-11-05T10:00:00Z",
+              "url": "https://x/1", "comments": [], "edits": [], "timeline": [],
+              "labels": [{"name": "from:" + sender},
+                         {"name": "to:" + ("alice" if sender == "bob" else "bob")},
+                         {"name": "status:" + status}]})
+        for member in ("alice", "bob"):
+            receipt = tmp / f"state/parley-axi/team/{member}/read.json"
+            receipt.unlink(missing_ok=True)
+
+    def call(*args, member="alice", extra=None, ok=True):
+        result = subprocess.run([str(ROOT / "bin/parley-axi"), "--as", member, *args],
+                                env={**env, "STUB_LOGIN": member + "-gh", **(extra or {})},
+                                text=True, capture_output=True)
+        assert (result.returncode == 0) == ok, (args, result.returncode, result.stderr)
+        return result.stdout
+
+    def unread(member="alice"):
+        return [item["number"] for item in json.loads(call("list", "--unread", "--json", member=member))]
+
+    def mutate(expression):
+        data = json.loads(file.read_text())
+        expression(data)
+        save(data)
+
+    fixture()
+    assert unread() == [1]
+    call("show", "1")
+    assert unread() == []
+    call("reply", "1", "Plain reply", member="bob")
+    assert unread() == [1], file.read_text()
+    assert unread("bob") == []
+    call("show", "1", "--json")
+    assert unread() == []
+    call("reply", "1", "My own reply")
+    assert unread() == []
+    assert unread("bob") == [1]
+    call("show", "1", member="bob")
+    assert unread("bob") == []
+    print("ok reader-owned receipts, replies in both directions, own activity")
+
+    for sender in ("alice", "bob"):
+        for state, status in (("OPEN", "open"), ("CLOSED", "done")):
+            fixture(sender, state, status)
+            call("show", "1")
+            mutate(lambda d: d["comments"].append({
+                "id": "github-comment", "body": "GitHub reply", "author": {"login": "bob-gh"},
+                "createdAt": "2026-11-05T11:00:00Z", "edits": [],
+            }))
+            assert unread() == [1], (sender, state)
+            call("show", "1")
+            mutate(lambda d: (d["comments"][0].update(body="Edited through GitHub"),
+                              d["comments"][0]["edits"].append({"id": "comment-edit", "editor": {"login": "bob-gh"}})))
+            assert unread() == [1]
+            call("show", "1")
+            mutate(lambda d: (d.update(body="Edited body"),
+                              d["edits"].append({"id": "body-edit", "editor": {"login": "bob-gh"}})))
+            assert unread() == [1]
+            call("show", "1")
+            assert unread() == []
+    print("ok GitHub comments and edits on incoming/sent, open/closed threads")
+
+    for event in ("RenamedTitleEvent", "ClosedEvent", "ReopenedEvent", "LabeledEvent", "UnlabeledEvent"):
+        fixture()
+        call("show", "1")
+        mutate(lambda d: d["timeline"].append({"id": event, "__typename": event,
+                                               "actor": {"login": "bob-gh"},
+                                               **({"label": {"name": "status:done"}} if "labeled" in event.lower() else {})}))
+        assert unread() == [1], event
+        call("show", "1")
+        assert unread() == []
+    fixture()
+    call("show", "1")
+    mutate(lambda d: d["timeline"].append({"id": "projection", "__typename": "LabeledEvent",
+                                          "actor": {"login": "bob-gh"}, "label": {"name": "unread:bob"}}))
+    assert unread() == []
+    print("ok title/lifecycle/status activity; unread projection does not self-wake")
+
+    for command, state, status, member in (("ack", "OPEN", "open", "alice"),
+                                            ("done", "OPEN", "open", "bob"),
+                                            ("decline", "OPEN", "open", "alice"),
+                                            ("reopen", "CLOSED", "done", "bob")):
+        fixture("bob", state, status)
+        call("show", "1")
+        call("show", "1", member="bob")
+        args = (command, "1") if command == "ack" else (command, "1", "Reason")
+        call(*args, member=member)
+        other = "bob" if member == "alice" else "alice"
+        assert unread(member) == []
+        assert unread(other) == [1]
+    print("ok all transition callers publish activity without setting reader markers")
+
+    for actor, expected in (("bob-gh", [1]), ("alice-gh", [])):
+        fixture()
+        assert unread() == [1]
+        printed = call("show", "1", extra={"STUB_READ_RACE": "1", "STUB_RACE_ACTOR": actor})
+        assert "A concurrent update" not in printed
+        assert unread() == expected
+    fixture()
+    call("show", "1")
+    mutate(lambda d: d["comments"].append({"id": "writer-crash", "body": "Landed after show",
+                                          "createdAt": "2026-11-05T12:00:00Z", "author": {"login": "bob-gh"}}))
+    assert unread() == [1]
+    before = (tmp / "state/parley-axi/team/alice/read.json").read_bytes()
+    for mode in ((), ("--json",)):
+        failed = subprocess.run(["bash", str(ROOT / "bin/parley-axi"), "show", "1", *mode], env=env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                preexec_fn=lambda: os.close(1))
+        assert failed.returncode != 0
+        assert (tmp / "state/parley-axi/team/alice/read.json").read_bytes() == before
+    result = subprocess.Popen([str(ROOT / "bin/parley-axi"), "show", "1"], env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    result.stdout.close()
+    assert result.wait() != 0
+    assert (tmp / "state/parley-axi/team/alice/read.json").read_bytes() == before
+    print("ok concurrent incoming activity survives; concurrent own activity stays read")
+
+    runner = tmp / "state/parley-axi/schedule/team/alice/tick.sh"
+    notification = tmp / "notification"
+    call("schedule", "install", "--every", "5m", "--notify", f"cat > '{notification}'",
+         extra={"STUB_SYSTEMCTL": "1"})
+    timer = tmp / "config/systemd/user/parley-axi-team:alice.timer"
+    systemd_expected = {"initial": "300s", "repeat": "300s", "target": "timers.target",
+                        "type": "oneshot", "exec": ["/bin/bash", str(runner)]}
+    subprocess.run(["python3", str(ROOT / "tests/schedule_contract.py"), "systemd", str(timer),
+                    json.dumps(systemd_expected)], check=True)
+    call("schedule", "tick")
+    assert notification.read_text() == "#1 unread from bob: Review request\n"
+    notification.unlink()
+    call("show", "1")
+    assert call("schedule", "tick") == ""
+    assert not notification.exists()
+    mutate(lambda d: d["comments"].append({"id": "check-comment", "body": "Check me",
+                                          "createdAt": "2026-11-05T12:00:00Z", "author": {"login": "bob-gh"}}))
+    result = subprocess.run(["bash", str(ROOT / "checks/parley.check.sh")], env=env,
+                            text=True, capture_output=True, check=True)
+    assert "1 unread message(s): #1 unread from bob: Review request" in result.stdout
+    call("schedule", "remove", extra={"STUB_SYSTEMCTL": "1"})
+    print("ok heartbeat stdin, silent read tick, and check share unread computation")
+
+    cron = stub / "crontab"
+    cron.write_text("17 * * * * echo unrelated-job\n")
+    unrelated = {"time": ["17", "*", "*", "*", "*"], "command": ["echo", "unrelated-job"]}
+
+    def entry(time, inbox="team"):
+        return {"time": time.split(), "command": ["/bin/bash", str(tmp / f"state/parley-axi/schedule/{inbox}/alice/tick.sh"),
+                                                    ">/dev/null", "2>&1", "#", f"parley-axi:{inbox}:alice"]}
+
+    def cron_contract(expected):
+        subprocess.run(["python3", str(ROOT / "tests/schedule_contract.py"), "cron", str(cron),
+                        json.dumps(expected)], check=True)
+
+    call("schedule", "install", "--every", "5m", "--notify", "true",
+         extra={"STUB_CRON_READ_FAIL": "1"}, ok=False)
+    cron_contract([unrelated])
+    call("schedule", "install", "--every", "5m", "--notify", "true")
+    cron_contract([unrelated, entry("*/5 * * * *")])
+    before = cron.read_bytes()
+    for args in (("schedule", "remove"), ("schedule", "install", "--every", "10m", "--notify", "true")):
+        call(*args, extra={"STUB_CRON_READ_FAIL": "1"}, ok=False)
+        assert cron.read_bytes() == before
+    call("schedule", "install", "--every", "10m", "--notify", "true")
+    call("--inbox", "other", "schedule", "install", "--every", "1h", "--notify", "true")
+    cron_contract([unrelated, entry("*/10 * * * *"), entry("0 */1 * * *", "other")])
+    call("schedule", "remove")
+    cron_contract([unrelated, entry("0 */1 * * *", "other")])
+    call("--inbox", "other", "schedule", "remove")
+    cron_contract([unrelated])
+    for interval in ("300", "0", "7m", "30s"):
+        call("schedule", "install", "--every", interval, "--notify", "true", ok=False)
+        cron_contract([unrelated])
+    print("ok cron read failures preserve all jobs; semantic cadence/replacement/removal contracts")

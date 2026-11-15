@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 
 ROOT = Path(__file__).absolute().parent.parent
 with tempfile.TemporaryDirectory(prefix="parley-review-") as tmp:
@@ -28,7 +29,7 @@ with tempfile.TemporaryDirectory(prefix="parley-review-") as tmp:
         "PARLEY_INTERVAL": "0",
     }
     for key in ("PARLEY_INBOX", "PARLEY_CRASH_AT", "STUB_GH_FAIL", "STUB_SYSTEMCTL",
-                "STUB_READ_RACE", "STUB_CRON_READ_FAIL", "STUB_RACE_ACTOR", "STUB_TOUCH_LABELS"):
+                "STUB_READ_RACE", "STUB_CRON_READ_FAIL", "STUB_RACE_ACTOR", "STUB_TOUCH_LABELS", "STUB_EDIT_FAIL", "STUB_SAME_SECOND", "STUB_CRON_HOLD"):
         env.pop(key, None)
     (tmp / "home").mkdir()
     config = tmp / "config/parley-axi/config.json"
@@ -46,7 +47,7 @@ with tempfile.TemporaryDirectory(prefix="parley-review-") as tmp:
     def save(data):
         file.write_text(json.dumps(data))
         (stub / "acme__team.issues.json").write_text(json.dumps([{
-            "number": 1, "title": data["title"], "state": data["state"].lower(),
+            "number": 1, "title": data["title"], "body": data["body"], "state": data["state"].lower(),
             "comments": len(data["comments"]), "labels": data["labels"],
             "created_at": data["createdAt"], "updated_at": data["updatedAt"],
             "html_url": data["url"],
@@ -62,7 +63,7 @@ with tempfile.TemporaryDirectory(prefix="parley-review-") as tmp:
                          {"name": "status:" + status}]})
         for member in ("alice", "bob"):
             for name in ("read", "activity", "state", "pending"):
-                (tmp / f"state/parley-axi/team/{member}/{name}.json").unlink(missing_ok=True)
+                (tmp / f"state/parley-axi/team/{member}/acme:team/{name}.json").unlink(missing_ok=True)
 
     def call(*args, member="alice", extra=None, ok=True):
         result = subprocess.run([str(ROOT / "bin/parley-axi"), "--as", member, *args],
@@ -75,10 +76,11 @@ with tempfile.TemporaryDirectory(prefix="parley-review-") as tmp:
         call("sync", "--no-commit", "--json", member=member)
         return [item["number"] for item in json.loads(call("list", "--unread", "--json", member=member))]
 
-    def mutate(expression):
+    def mutate(expression, advance=True):
         data = json.loads(file.read_text())
         expression(data)
-        data["updatedAt"] = (datetime.fromisoformat(data["updatedAt"].replace("Z", "+00:00")) + timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if advance:
+            data["updatedAt"] = (datetime.fromisoformat(data["updatedAt"].replace("Z", "+00:00")) + timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
         save(data)
 
     fixture()
@@ -159,18 +161,18 @@ with tempfile.TemporaryDirectory(prefix="parley-review-") as tmp:
     mutate(lambda d: d["comments"].append({"id": "writer-crash", "body": "Landed after show",
                                           "createdAt": "2026-11-05T12:00:00Z", "author": {"login": "bob-gh"}}))
     assert unread() == [1]
-    before = (tmp / "state/parley-axi/team/alice/read.json").read_bytes()
+    before = (tmp / "state/parley-axi/team/alice/acme:team/read.json").read_bytes()
     for mode in ((), ("--json",)):
         failed = subprocess.run(["bash", str(ROOT / "bin/parley-axi"), "show", "1", *mode], env=env,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                 preexec_fn=lambda: os.close(1))
         assert failed.returncode != 0
-        assert (tmp / "state/parley-axi/team/alice/read.json").read_bytes() == before
+        assert (tmp / "state/parley-axi/team/alice/acme:team/read.json").read_bytes() == before
     result = subprocess.Popen([str(ROOT / "bin/parley-axi"), "show", "1"], env=env,
                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     result.stdout.close()
     assert result.wait() != 0
-    assert (tmp / "state/parley-axi/team/alice/read.json").read_bytes() == before
+    assert (tmp / "state/parley-axi/team/alice/acme:team/read.json").read_bytes() == before
     print("ok concurrent incoming activity survives; concurrent own activity stays read")
 
     fixture()
@@ -187,6 +189,80 @@ with tempfile.TemporaryDirectory(prefix="parley-review-") as tmp:
     call("show", "1")
     assert unread() == []
     print("ok stale show cannot discard known unread activity or cached versions")
+
+    for mode in ((), ("--json",)):
+        fixture()
+        assert unread() == [1]
+        displayed = call("show", "1", *mode, extra={"STUB_EDIT_FAIL": "1"}, ok=False)
+        assert "Old body" in displayed
+        assert [item["number"] for item in json.loads(call("list", "--unread", "--json"))] == []
+        assert "unread:alice" in [label["name"] for label in json.loads(file.read_text())["labels"]]
+        Path(env["STUB_LOG"]).write_text("")
+        call("sync", "--json")
+        assert "unread:alice" not in [label["name"] for label in json.loads(file.read_text())["labels"]]
+        assert not any(line.startswith("api graphql") for line in Path(env["STUB_LOG"]).read_text().splitlines())
+    fixture()
+    call("sync", "--json", extra={"STUB_EDIT_FAIL": "1"}, ok=False)
+    assert [item["number"] for item in json.loads(call("list", "--unread", "--json"))] == [1]
+    Path(env["STUB_LOG"]).write_text("")
+    assert [(item["number"], item["event"]) for item in json.loads(call("sync", "--json"))] == [(1, "new")]
+    assert not any(line.startswith("api graphql") for line in Path(env["STUB_LOG"]).read_text().splitlines())
+    print("ok receipts control cached unread despite failed projection; sync retries publication without history scans")
+
+    fixture()
+    call("sync", "--json")
+    call("show", "1")
+    call("reply", "1", "Same-second incoming reply", member="bob", extra={"STUB_SAME_SECOND": "1"})
+    problems = json.loads(call("sync", "--verify", "--json", ok=False))["problems"]
+    assert any("#1 update not surfaced" in problem for problem in problems)
+    delivered = json.loads(call("sync", "--json"))
+    assert [(item["number"], item["event"]) for item in delivered] == [(1, "updated")]
+    assert [item["number"] for item in json.loads(call("list", "--unread", "--json"))] == [1]
+    assert json.loads(call("sync", "--json")) == []
+    call("show", "1")
+    call("reply", "1", "Same-second own reply", extra={"STUB_SAME_SECOND": "1"})
+    assert unread() == []
+    for field in ("title", "body", "state", "status"):
+        fixture()
+        call("show", "1")
+        def edit(data):
+            event = {"id": "same-second-" + field, "actor": {"login": "bob-gh"}}
+            if field == "title":
+                data["title"] = "Renamed request"
+                data["timeline"].append({**event, "__typename": "RenamedTitleEvent"})
+            elif field == "body":
+                data["body"] = "Edited body in the same second"
+                data["edits"].append({"id": event["id"], "editor": event["actor"]})
+            elif field == "state":
+                data["state"] = "CLOSED"
+                data["timeline"].append({**event, "__typename": "ClosedEvent"})
+            else:
+                data["labels"] = [label for label in data["labels"] if not label["name"].startswith("status:")]
+                data["labels"].append({"name": "status:acknowledged"})
+                data["timeline"].append({**event, "__typename": "LabeledEvent", "label": {"name": "status:acknowledged"}})
+        mutate(edit, advance=False)
+        assert unread() == [1], field
+        call("show", "1")
+        assert unread() == []
+    print("ok same-second comments, title/body edits, state/status changes and delivery verification")
+
+    for sender, prefix in (("bob", "to:"), ("alice", "from:")):
+        fixture(sender=sender)
+        if sender == "alice":
+            call("reply", "1", "Incoming on a sent thread", member="bob")
+        assert unread() == [1]
+        original = json.loads(file.read_text())
+        mutate(lambda d: d.update(labels=[{"name": prefix + "carol"} if label["name"].startswith(prefix) else label
+                                         for label in d["labels"]]), advance=False)
+        assert unread() == []
+        call("show", "1", ok=False)
+        assert "unread:alice" not in [label["name"] for label in json.loads(file.read_text())["labels"]]
+        result = subprocess.run(["bash", str(ROOT / "checks/parley.check.sh")], env=env,
+                                text=True, capture_output=True, check=True)
+        assert result.stdout == ""
+        save(original)
+        assert unread() == [1]
+    print("ok raw same-second sender/recipient retargeting revokes cached participation and read access")
 
     fixture()
     long_body = "x" * 50_000
@@ -219,7 +295,7 @@ with tempfile.TemporaryDirectory(prefix="parley-review-") as tmp:
     listing = json.loads((stub / "acme__team.issues.json").read_text())
     listing.append({**listing[0], "number": 2, "title": "Second request", "html_url": "https://x/2"})
     (stub / "acme__team.issues.json").write_text(json.dumps(listing))
-    lock = tmp / "state/parley-axi/team/alice/state.lock"
+    lock = tmp / "state/parley-axi/team/alice/acme:team/state.lock"
     lock.parent.mkdir(parents=True, exist_ok=True)
     import fcntl
     with lock.open("w") as held:
@@ -317,13 +393,44 @@ with tempfile.TemporaryDirectory(prefix="parley-review-") as tmp:
     repo_config.write_text(original_config)
     print("ok every ordered prefix-overlap pair is rejected before publishing labels")
 
+    fixture()
+    assert unread() == [1]
+    call("init", "--repo", "acme/team", "--direct")
+    replacement = json.loads(file.read_text())
+    replacement.update(id="replacement-thread-1", title="Replacement request", body="Replacement body",
+                       createdAt="2025-01-01T00:00:00Z", updatedAt="2025-01-01T00:00:00Z", url="https://replacement/1")
+    replacement["labels"] = [label for label in replacement["labels"] if not label["name"].startswith("unread:")]
+    (stub / "acme__replacement.parley.json").write_text(original_config)
+    (stub / "acme__replacement.issue-1.json").write_text(json.dumps(replacement))
+    (stub / "acme__replacement.issues.json").write_text(json.dumps([{
+        "number": 1, "title": replacement["title"], "body": replacement["body"], "state": "open", "comments": 0,
+        "labels": replacement["labels"], "created_at": replacement["createdAt"], "updated_at": replacement["updatedAt"],
+        "html_url": replacement["url"],
+    }]))
+    call("init", "--repo", "acme/replacement", "--direct")
+    call("setup", "--repo", "acme/replacement", "--name", "team", "--default")
+    assert json.loads(call("list", "--unread", "--json")) == []
+    replacement_events = json.loads(call("sync", "--json"))
+    assert [(item["number"], item["subject"], item["url"]) for item in replacement_events] == [(1, "Replacement request", "https://replacement/1")]
+    scoped_notification = tmp / "scoped-notification"
+    call("schedule", "install", "--every", "5m", "--notify", f"cat > '{scoped_notification}'", extra={"STUB_SYSTEMCTL": "1"})
+    call("schedule", "tick")
+    assert scoped_notification.read_text() == "#1 unread from bob: Replacement request\n"
+    call("schedule", "remove", extra={"STUB_SYSTEMCTL": "1"})
+    assert "Replacement body" in call("show", "1")
+    assert unread() == []
+    call("setup", "--repo", "acme/team", "--name", "team", "--default")
+    restored = json.loads(call("list", "--unread", "--json"))
+    assert [(item["subject"], item["url"]) for item in restored] == [("Review request", "https://x/1")]
+    print("ok alias reassignment isolates receipts, cached messages, delivery and heartbeat by repository")
+
     cron = stub / "crontab"
     cron.write_text("17 * * * * echo unrelated-job\n")
     unrelated = {"time": ["17", "*", "*", "*", "*"], "command": ["echo", "unrelated-job"]}
 
-    def entry(time, inbox="team"):
-        return {"time": time.split(), "command": ["/bin/bash", str(tmp / f"state/parley-axi/schedule/{inbox}/alice/tick.sh"),
-                                                    ">/dev/null", "2>&1", "#", f"parley-axi:{inbox}:alice"]}
+    def entry(time, inbox="team", member="alice"):
+        return {"time": time.split(), "command": ["/bin/bash", str(tmp / f"state/parley-axi/schedule/{inbox}/{member}/tick.sh"),
+                                                    ">/dev/null", "2>&1", "#", f"parley-axi:{inbox}:{member}"]}
 
     def cron_contract(expected):
         subprocess.run(["python3", str(ROOT / "tests/schedule_contract.py"), "cron", str(cron),
@@ -349,3 +456,49 @@ with tempfile.TemporaryDirectory(prefix="parley-review-") as tmp:
         call("schedule", "install", "--every", interval, "--notify", "true", ok=False)
         cron_contract([unrelated])
     print("ok cron read failures preserve all jobs; semantic cadence/replacement/removal contracts")
+
+    def wait_for(condition):
+        deadline = time.monotonic() + 15
+        while not condition():
+            assert time.monotonic() < deadline, "scheduler boundary did not become ready"
+            time.sleep(0.02)
+
+    def concurrent_schedules(first_args, second_args, expected):
+        for name in ("read-first", "read-second", "release-first", "release-second"):
+            (stub / name).unlink(missing_ok=True)
+        first = subprocess.Popen([str(ROOT / "bin/parley-axi"), *first_args],
+                                 env={**env, "STUB_CRON_HOLD": "first"}, text=True,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        wait_for(lambda: (stub / "read-first").exists())
+        Path(env["STUB_LOG"]).write_text("")
+        second = subprocess.Popen([str(ROOT / "bin/parley-axi"), *second_args],
+                                  env={**env, "STUB_CRON_HOLD": "second"}, text=True,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            wait_for(lambda: "contents/.parley.json" in Path(env["STUB_LOG"]).read_text())
+            time.sleep(0.3)
+            assert not (stub / "read-second").exists()
+            (stub / "release-first").touch()
+            wait_for(lambda: (stub / "read-second").exists())
+            (stub / "release-second").touch()
+            for child in (first, second):
+                stdout, stderr = child.communicate(timeout=30)
+                assert child.returncode == 0, stderr
+            cron_contract(expected)
+        finally:
+            for name in ("release-first", "release-second"):
+                (stub / name).touch()
+            for child in (first, second):
+                if child.poll() is None:
+                    child.terminate()
+                child.communicate(timeout=30)
+
+    concurrent_schedules(("schedule", "install", "--every", "5m", "--notify", "true"),
+                         ("--inbox", "other", "--as", "bob", "schedule", "install", "--every", "1h", "--notify", "true"),
+                         [unrelated, entry("*/5 * * * *"), entry("0 */1 * * *", "other", "bob")])
+    concurrent_schedules(("schedule", "remove"),
+                         ("--inbox", "other", "--as", "bob", "schedule", "install", "--every", "10m", "--notify", "true"),
+                         [unrelated, entry("*/10 * * * *", "other", "bob")])
+    call("--inbox", "other", "--as", "bob", "schedule", "remove")
+    cron_contract([unrelated])
+    print("ok concurrent installs and remove/reinstall preserve schedules across inboxes and members")

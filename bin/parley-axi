@@ -180,14 +180,14 @@ use_config() {
 is_member() { jq -e --arg id "$1" 'any(.members[]; .id == $id)' <<<"$CFG" >/dev/null; }
 member_ids() { jq -r '[.members[].id] | join(", ")' <<<"$CFG"; }
 
-# labels_tsv: every label the config defines, as name<TAB>color<TAB>description.
+# labels_tsv: initial routing/status labels, as name<TAB>color<TAB>description.
 labels_tsv() {
   jq -r '.labels as $l | ($l.colors | map_values(tostring | ltrimstr("#"))) as $c |
     (.members[] | [$l.to + .id, $c.to, "Message to \(.name // .id)"], [$l.from + .id, $c.from, "Message from \(.name // .id)"]),
     ($l.statuses | (.open, .acknowledged, .done, .declined) | [$l.status + ., $c.status, "Message status: \(.)"]) | @tsv' <<<"$CFG"
 }
 
-# resolve: picks the inbox (--inbox, PARLEY_INBOX, then the default), sets INBOX, REPO, ME and loads the repo config.
+# resolve_local: picks the inbox (--inbox, PARLEY_INBOX, then the default) and sets INBOX, REPO, ME offline.
 resolve_local() {
   [ -f "$CONF" ] || die "no inbox configured: run parley-axi setup --repo <owner/name> --as <member-id>"
   INBOX=${F_inbox:-${PARLEY_INBOX:-$(jq -r '.default // empty' "$CONF")}}

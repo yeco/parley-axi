@@ -30,7 +30,7 @@ with tempfile.TemporaryDirectory(prefix="parley-review-") as tmp:
         "PARLEY_INTERVAL": "0",
     }
     for key in ("PARLEY_INBOX", "PARLEY_CRASH_AT", "STUB_GH_FAIL", "STUB_SYSTEMCTL",
-                "STUB_READ_RACE", "STUB_CRON_READ_FAIL", "STUB_RACE_ACTOR", "STUB_TOUCH_LABELS", "STUB_EDIT_FAIL", "STUB_SAME_SECOND", "STUB_CRON_HOLD"):
+                "STUB_READ_RACE", "STUB_CRON_READ_FAIL", "STUB_RACE_ACTOR", "STUB_TOUCH_LABELS", "STUB_EDIT_FAIL", "STUB_SAME_SECOND", "STUB_CRON_HOLD", "STUB_TIMELINE_RACE", "STUB_TIMELINE_STALE"):
         env.pop(key, None)
     (tmp / "home").mkdir()
     config = tmp / "config/parley-axi/config.json"
@@ -55,6 +55,7 @@ with tempfile.TemporaryDirectory(prefix="parley-review-") as tmp:
         }]))
 
     def fixture(sender="bob", state="OPEN", status="open"):
+        (stub / "timeline-count").unlink(missing_ok=True)
         save({"id": "thread-1", "number": 1, "title": "Review request", "body": "Old body",
               "author": {"login": sender + "-gh"}, "state": state,
               "createdAt": "2026-11-05T10:00:00Z", "updatedAt": "2026-11-05T10:00:00Z",
@@ -176,6 +177,71 @@ with tempfile.TemporaryDirectory(prefix="parley-review-") as tmp:
     assert result.wait() != 0
     assert (tmp / "state/parley-axi/team/alice/acme:team/read.json").read_bytes() == before
     print("ok concurrent incoming activity survives; concurrent own activity stays read")
+
+    for sender in ("alice", "bob"):
+        for mode in ((), ("--json",)):
+            for actor, expected in (("bob-gh", [1]), ("alice-gh", [])):
+                fixture(sender=sender)
+                call("show", "1")
+                printed = call("show", "1", *mode, extra={"STUB_TIMELINE_RACE": "after-second", "STUB_RACE_ACTOR": actor})
+                if mode:
+                    assert json.loads(printed)["state"] == "OPEN"
+                else:
+                    assert "status:open open" in printed
+                assert unread() == expected, (sender, mode, actor)
+                if expected:
+                    call("show", "1", *mode)
+                    assert unread() == []
+    fixture()
+    call("show", "1")
+    printed = json.loads(call("show", "1", "--json", extra={"STUB_TIMELINE_RACE": "before-first"}))
+    assert printed["state"] == "CLOSED"
+    assert int((stub / "timeline-count").read_text()) == 3
+    assert unread() == []
+    for mode in ((), ("--json",)):
+        fixture()
+        call("sync", "--json")
+        call("show", "1")
+        mutate(lambda d: (d.update(state="CLOSED"), d["timeline"].append({
+            "id": "unseen-close", "__typename": "ClosedEvent", "actor": {"login": "bob-gh"}})))
+        assert unread() == [1]
+        state_dir = tmp / "state/parley-axi/team/alice/acme:team"
+        before = {name: (state_dir / name).read_bytes() for name in ("read.json", "activity.json", "state.json")}
+        assert call("show", "1", *mode, extra={"STUB_TIMELINE_STALE": "1"}, ok=False) == ""
+        assert int((stub / "timeline-count").read_text()) == 2
+        assert {name: (state_dir / name).read_bytes() for name in before} == before
+        assert [item["number"] for item in json.loads(call("list", "--unread", "--json"))] == [1]
+        assert "unread:alice" in [label["name"] for label in json.loads(file.read_text())["labels"]]
+        call("show", "1", *mode)
+        assert unread() == []
+    for mode in ((), ("--json",)):
+        fixture()
+        call("show", "1")
+        state_dir = tmp / "state/parley-axi/team/alice/acme:team"
+        before = (state_dir / "activity.json").read_bytes()
+        printed = call("show", "1", *mode, extra={"STUB_TIMELINE_RACE": "after-first",
+                       "STUB_TIMELINE_STALE": "after-first"}, ok=False)
+        if mode:
+            assert json.loads(printed)["state"] == "OPEN"
+        else:
+            assert "status:open open" in printed
+        assert int((stub / "timeline-count").read_text()) == 3
+        assert (state_dir / "activity.json").read_bytes() == before
+        assert unread() == [1]
+        call("show", "1", *mode)
+        assert unread() == []
+    fixture()
+    call("sync", "--json")
+    mutate(lambda d: (d.update(state="CLOSED"), d["timeline"].append({
+        "id": "sync-close", "__typename": "ClosedEvent", "actor": {"login": "bob-gh"}})))
+    state_dir = tmp / "state/parley-axi/team/alice/acme:team"
+    before = {name: (state_dir / name).read_bytes() for name in ("read.json", "activity.json", "state.json")}
+    call("sync", "--json", extra={"STUB_TIMELINE_STALE": "1"}, ok=False)
+    assert int((stub / "timeline-count").read_text()) == 2
+    assert {name: (state_dir / name).read_bytes() for name in before} == before
+    assert [(item["number"], item["event"]) for item in json.loads(call("sync", "--json"))] == [(1, "updated")]
+    assert unread() == [1]
+    print("ok post-print status races remain unread; mismatched timeline versions retry once, then preserve receipts/cache/delivery")
 
     fixture()
     call("show", "1")

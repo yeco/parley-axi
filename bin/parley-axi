@@ -54,7 +54,7 @@ Lines: #number from:<who> <status> <age> "subject" url   (--sent shows to:<who>)
 status is the lifecycle state (open, acknowledged, done, declined), or none/conflict/unknown when the labels are broken.
 EOF
     ;;
-    show) echo "usage: parley-axi show <n> [--json]   Prints the message header, body and comments, then clears your unread marker. Edits do not mark unread. Sender or recipient only." ;;
+    show) echo "usage: parley-axi show <n> [--json]   Prints the message header, body and comments, then clears your unread marker. Inconsistent metadata/activity retries once, then fails without saving that observation. Edits do not mark unread. Sender or recipient only." ;;
     reply) echo "usage: parley-axi reply <n> <text>|-   Adds a comment; the other party detects unread activity on sync. '-' reads stdin. Sender or recipient only." ;;
     ack) echo "usage: parley-axi ack <n>   Recipient only. open -> acknowledged." ;;
     done) echo "usage: parley-axi done <n> [note]   Sender or recipient. open|acknowledged -> done, closes the issue. Either party should mark done when nothing actionable is left: the question answered and applied, or the request fulfilled." ;;
@@ -294,35 +294,46 @@ fetch_issues() {
 }
 
 fetch_thread() {
-  local n=$1 thread comments timeline login
+  local n=$1 thread comments timeline login attempt
   login=$(jq -r --arg me "$ME" '.members[] | select(.id == $me) | .github | ascii_downcase' <<<"$CFG")
-  timeline=$(gh api graphql --paginate -f owner="${REPO%/*}" -f name="${REPO#*/}" -F number="$n" -f query="$(cat <<'GRAPHQL'
-    query($owner:String!, $name:String!, $number:Int!, $endCursor:String) {
-      repository(owner:$owner,name:$name) { issue(number:$number) {
-        timelineItems(first:100,after:$endCursor,itemTypes:[CLOSED_EVENT,REOPENED_EVENT,LABELED_EVENT,UNLABELED_EVENT]) {
-          pageInfo { hasNextPage endCursor } nodes {
-            __typename
-            ... on ClosedEvent { id actor { login } }
-            ... on ReopenedEvent { id actor { login } }
-            ... on LabeledEvent { id actor { login } label { name } }
-            ... on UnlabeledEvent { id actor { login } label { name } }
-          }
-        }
-      } }
-    }
-GRAPHQL
-)" | jq -cs --arg st "$P_ST" '[.[].data.repository.issue.timelineItems.nodes[] |
-      select(.label == null or (.label.name | startswith($st))) | {id, actor: .actor.login}]') || return 1
-  thread=$(gh api graphql -f owner="${REPO%/*}" -f name="${REPO#*/}" -F number="$n" -f query="$(cat <<'GRAPHQL'
-    query($owner:String!, $name:String!, $number:Int!) {
-      repository(owner:$owner,name:$name) { issue(number:$number) {
-        id number title body state createdAt updatedAt url author { login }
-        labels(first:100) { nodes { name } }
-      } }
-    }
+  for attempt in 1 2; do
+    thread=$(gh api graphql -f owner="${REPO%/*}" -f name="${REPO#*/}" -F number="$n" -f query="$(cat <<'GRAPHQL'
+      query($owner:String!, $name:String!, $number:Int!) {
+        repository(owner:$owner,name:$name) { issue(number:$number) {
+          id number title body state createdAt updatedAt url author { login }
+          labels(first:100) { nodes { name } }
+        } }
+      }
 GRAPHQL
 )" | jq -ce '.data.repository.issue | select(.id != null) | .labels = .labels.nodes |
-    .activity = [{id, actor: .author.login}]') || return 1
+      .activity = [{id, actor: .author.login}]') || return 1
+    timeline=$(gh api graphql --paginate -f owner="${REPO%/*}" -f name="${REPO#*/}" -F number="$n" -f query="$(cat <<'GRAPHQL'
+      query($owner:String!, $name:String!, $number:Int!, $endCursor:String) {
+        repository(owner:$owner,name:$name) { issue(number:$number) {
+          updatedAt
+          timelineItems(first:100,after:$endCursor,itemTypes:[CLOSED_EVENT,REOPENED_EVENT,LABELED_EVENT,UNLABELED_EVENT]) {
+            pageInfo { hasNextPage endCursor } nodes {
+              __typename
+              ... on ClosedEvent { id actor { login } }
+              ... on ReopenedEvent { id actor { login } }
+              ... on LabeledEvent { id actor { login } label { name } }
+              ... on UnlabeledEvent { id actor { login } label { name } }
+            }
+          }
+        } }
+      }
+GRAPHQL
+)") || return 1
+    if timeline=$(jq -ces --arg updated "$(jq -r .updatedAt <<<"$thread")" --arg st "$P_ST" '
+      select(all(.[]; .data.repository.issue.updatedAt == $updated)) |
+      [.[].data.repository.issue.timelineItems.nodes[] |
+        select(.label == null or (.label.name | startswith($st))) | {id, actor: .actor.login}]' <<<"$timeline"); then
+      break
+    elif [ "$attempt" = 2 ]; then
+      echo "parley-axi: #$n changed while fetching activity; observation not saved" >&2
+      return 1
+    fi
+  done
   comments=$(gh api graphql --paginate -f owner="${REPO%/*}" -f name="${REPO#*/}" -F number="$n" -f query="$(cat <<'GRAPHQL'
     query($owner:String!, $name:String!, $number:Int!, $endCursor:String) {
       repository(owner:$owner,name:$name) { issue(number:$number) {

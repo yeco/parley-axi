@@ -50,7 +50,22 @@ case "$1 $2" in
           .createdAt //= "2026-11-05T10:00:00Z" | .updatedAt //= .createdAt | .url //= "https://x" |
           .comments //= [] | .comments |= (to_entries | map(.value + {id:(.value.id // ($id + "-comment-" + (.key|tostring)))}))' "$f")
         if [[ $query == *timelineItems* ]]; then
-          jq --arg query "$query" '{data:{repository:{issue:{timelineItems:{nodes:[(.timeline // [])[] |
+          if [ -n "${STUB_TIMELINE_RACE:-}${STUB_TIMELINE_STALE:-}" ]; then
+            count=$(cat "$STUB_DIR/timeline-count" 2>/dev/null || echo 0)
+            count=$((count + 1))
+            echo "$count" > "$STUB_DIR/timeline-count"
+            if [[ ${STUB_TIMELINE_RACE:-}:$count == before-first:1 || ${STUB_TIMELINE_RACE:-}:$count == after-first:1 || ${STUB_TIMELINE_RACE:-}:$count == after-second:2 ]]; then
+              jq --arg actor "${STUB_RACE_ACTOR:-bob-gh}" '
+                .state = "CLOSED" | .timeline += [{id:"timeline-close", __typename:"ClosedEvent", actor:{login:$actor}}]' \
+                "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+              touch_issue issue close "$n"
+              if [ "$STUB_TIMELINE_RACE" = before-first ]; then view=$(cat "$f"); fi
+            fi
+            if [ "${STUB_TIMELINE_STALE:-}" = 1 ] || { [ "${STUB_TIMELINE_STALE:-}" = after-first ] && [ "$count" -gt 1 ]; }; then
+              view=$(jq '.updatedAt |= (fromdateiso8601 - 1 | todateiso8601) | .timeline = []' <<<"$view")
+            fi
+          fi
+          jq --arg query "$query" '{data:{repository:{issue:{updatedAt:.updatedAt,timelineItems:{nodes:[(.timeline // [])[] |
             select(.__typename != "RenamedTitleEvent" or ($query | contains("RENAMED_TITLE_EVENT")))]}}}}}' <<<"$view" | emit
         elif [[ $query == *"id number title body"* ]]; then
           jq '{data:{repository:{issue:(del(.comments, .edits, .timeline) | . + {labels:{nodes:.labels}})}}}' <<<"$view" | emit

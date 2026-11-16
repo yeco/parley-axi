@@ -207,6 +207,16 @@ output are suppressed. A failed sync or notification leaves delivery pending for
 notifications repeat on the next interval until the reader runs `show`. Message text is data,
 never part of the shell command. Use a command that tolerates repeated notifications.
 
+Known scheduler limits:
+- Background notifier descendants can inherit descriptor 9 and retain `tick.lock` after the
+  notifier returns, silently blocking later ticks. Keep notification work foreground, or close
+  descriptor 9 inside the notification command before it launches background descendants
+  (e.g. `--notify 'exec 9>&-; notify-agent'`).
+- Cron `schedule status` can report active for commented entries or ownership-tag substrings.
+  Inspect `crontab -l` for the exact **uncommented** generated entry: check its cadence,
+  `/bin/bash` runner path, and complete trailing `# parley-axi:<inbox>:<member>` tag.
+  An active status alone does not confirm cron is running the heartbeat.
+
 Files live under `$XDG_STATE_HOME/parley-axi/schedule/<inbox>/<member>/` and, for systemd units,
 `$XDG_CONFIG_HOME/systemd/user/`. No root privileges are needed. The heartbeat is an alternative
 to polling the check, not something you need to run alongside it.

@@ -23,15 +23,17 @@ help_for() {
   case $1 in
     init) cat <<'EOF'
 usage: parley-axi init --repo <owner/name> [--member <id>[:<github-login>[:<Display Name>]]]... [--direct]
-Writes a starter .parley.json to the inbox repo and creates every label it defines. Idempotent:
-an existing .parley.json is kept as is, an open init PR is reused, and labels are created or updated.
+Writes a starter .parley.json to the inbox repo and creates its routing and status labels. Idempotent:
+an existing .parley.json is kept as is, an open init PR is reused, and routing/status labels are created or updated.
+Unread labels are created on demand by readers.
 Default: opens a PR from branch parley-init. --direct: commits straight to the default branch.
 Without --member, the starter config has one member: your gh login.
 EOF
     ;;
     setup) cat <<'EOF'
 usage: parley-axi setup --repo <owner/name> --as <member-id> [--name <inbox>] [--default]
-Saves an inbox to the local config after checking that you are a member and that every label exists.
+Saves an inbox to the local config after checking membership and that routing and status labels exist.
+Unread labels are created on demand by readers.
 --name defaults to the repo name. The first inbox you set up becomes the default; --default switches it.
 EOF
     ;;

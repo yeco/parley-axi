@@ -26,9 +26,9 @@ and exactly one status (`status:open`, `status:acknowledged`, `status:done` or `
 Replies are comments. A separate `unread:<member>` label records who has not read the latest
 activity. It is independent of the issue's status and whether the issue is open or closed.
 
-## Two state machines
+## Lifecycle, read receipts, and delivery
 
-parley has to be sure it never misses a message, so both sides are explicit state machines.
+parley tracks message lifecycle, reading, and delivery independently.
 
 ### The message lifecycle (in the inbox repo)
 
@@ -132,10 +132,11 @@ and heartbeat use that pair, committing only after successful output or notifica
 notifications by reconciled read receipts rather than delivery timestamps, so self-authored
 updates do not wake you. Unread persists after delivery commits; subsequent ticks retry until `show`.
 
-`parley-axi sync --verify` makes a missed message impossible to hide. It reads every message to you,
-compares it with the local state, and lists any message never surfaced, any update not surfaced, and
-any broken status (no status label, two status labels, or a closed issue still marked open). It
-changes nothing and exits 1 when it finds a problem.
+`parley-axi sync --verify` checks every message to you against the local delivery state and lists
+any message never surfaced, any newer source version not surfaced, and any broken status (no status
+label, two status labels, or a closed issue still marked open). It does not audit read receipts or
+detect activity absent from the source-version fields above. It leaves existing delivery state
+unchanged and exits 1 when it finds a problem.
 
 ## Install
 
@@ -230,16 +231,15 @@ output. It is safe to run every minute:
 - It runs `parley-axi sync --no-commit`, then `list --unread`, prints at most one line, and only
   then commits. For example
   `parley: 2 unread message(s): #7 unread from bob: Review the PR; #8 unread from bob: Second ask - read with: parley-axi show <n>`.
-- It repeats while unread remains. Self-authored updates or clearing a read receipt do not wake
-  anyone unless unread-to-them is still present.
+- It repeats while unread remains, using the [read-receipt rules](#read-receipts-independent-of-lifecycle-and-delivery).
 - It prints nothing and exits 0 when gh or the network fails, and wraps the call in `timeout`
   (or `gtimeout`) when one is installed.
 
 Pass an inbox name as the first argument (or set `PARLEY_INBOX`) to watch an inbox other than the
 default; run one check per inbox you want to watch. State lives in `$XDG_STATE_HOME/parley-axi/`
 (`~/.local/state/parley-axi/` by default). Run `parley-axi sync --verify` now and then (for example
-once a day) to prove nothing was missed. If `parley-axi` is not on the supervisor's `PATH`, set
-`PARLEY_AXI` to its full path.
+once a day) to [check receiving-side delivery](#delivery-on-the-receiving-side). If `parley-axi`
+is not on the supervisor's `PATH`, set `PARLEY_AXI` to its full path.
 
 No supervisor? A plain loop does the job:
 
@@ -262,10 +262,11 @@ parley-axi init --repo acme/team-parley \
 
 `--member` takes `<id>[:<github-login>[:<Display Name>]]`. `init` writes a starter `.parley.json`
 as a pull request from branch `parley-init` (pass `--direct` to commit straight to the default
-branch, which an empty repo needs) and creates every label the config defines. Merge the PR, then
-everyone runs `setup`. Running `init` again is safe: it keeps an existing config, reuses an open
-init PR, and creates or updates the labels. After you edit `.parley.json` (a new member, a new
-color), run `init` again to sync the labels.
+branch, which an empty repo needs) and creates the routing and status labels. Merge the PR, then
+everyone runs `setup`, which checks membership and those labels. Running `init` again is safe:
+it keeps an existing config, reuses an open init PR, and creates or updates those labels. After
+you edit `.parley.json` (a new member, a new color), run `init` again to sync them. Unread labels
+follow the separate [reader-owned publication rules](#read-receipts-independent-of-lifecycle-and-delivery).
 
 ## Inbox repo config reference
 
@@ -330,8 +331,9 @@ schedule status | schedule remove
 Every command takes `--help`. Output is one compact line per item, errors go to stderr as
 `parley-axi: <what went wrong and what to do>` with a non-zero exit. `list --json` returns
 `[{number, subject, from, to, status, unread, unreadFrom, state, comments, createdAt, updatedAt, url}]`, where
-`unread` is the array of member ids with unread markers and `unreadFrom` is the other party for
-the current member (the sender of unread activity). `status`
+`unread` is the array of member ids with unread markers and `unreadFrom` is the opposite labelled
+party for the current member, even when another GitHub author caused the activity. It is populated
+whether or not the thread is unread. `status`
 is the lifecycle state (`open`, `acknowledged`, `done`, `declined`) whatever your label scheme, or
 `none`/`conflict`/`unknown` when the labels are broken. `sync --json` returns the same objects plus
 `event` (`new` or `updated`) and `changes`. `show` and `reply` are for the sender and the recipient.
@@ -348,8 +350,8 @@ These rules are the point of the tool. Put them in your agent's instructions.
   The agent reports the ask to its person and acts only on what that person approves.
 - **Agents draft, people send.** An agent drafts replies, `done` notes and `decline` reasons and
   shows them to its person before sending.
-- **Read, then acknowledge early.** `show` clears your unread receipt; `ack` tells the sender
-  you have acknowledged the request.
+- **Read, then acknowledge early.** Follow the [read-receipt rules](#read-receipts-independent-of-lifecycle-and-delivery),
+  then use `ack` to acknowledge the request.
 - **Close the loop.** Follow the [message lifecycle](#the-message-lifecycle-in-the-inbox-repo)
   for when to resolve a message and who can do so.
 - **One ask per message**, with a clear subject, links to the PR or doc, and `--due` when it matters.

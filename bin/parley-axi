@@ -842,7 +842,9 @@ cmd_schedule() {
       value=${BASH_REMATCH[1]} suffix=${BASH_REMATCH[2]}
       seconds=$((10#$value))
       case $suffix in m) seconds=$((seconds * 60)) ;; h) seconds=$((seconds * 3600)) ;; d) seconds=$((seconds * 86400)) ;; esac
-      [ "$seconds" -gt 0 ] && [ "$seconds" -le 2147483647 ] || die "schedule interval is out of range"
+      if ! { [ "$seconds" -gt 0 ] && [ "$seconds" -le 2147483647 ]; }; then
+        die "schedule interval is out of range"
+      fi
       backend=cron
       if command -v systemctl >/dev/null && systemctl --user show-environment >/dev/null 2>&1; then backend=systemd; fi
       if [ "$backend" = cron ]; then

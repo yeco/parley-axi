@@ -72,6 +72,16 @@ repository selects separate receipts, activity, pending delivery, and cursors; s
 reuses that repository's state. A new repository without receipts treats other-author history
 as unread, including closed threads.
 
+Thread metadata is fetched before activity. Every timeline page must report the same issue
+`updatedAt` as that metadata; a mismatch retries the observation once. A second mismatch fails
+without saving that observation as a receipt or cached version. If the post-print refresh fails,
+the receipt for the already printed, consistent snapshot remains valid, but no newer cache version
+is committed; a later successful sync can discover the unprinted transition.
+
+Known limit: this bounded timestamp check is not an atomic GitHub snapshot. Same-second status
+changes or eventual timeline indexing can evade it; timestamps alone cannot prove that every
+activity event is visible. Existing body, title, and comment edits remain outside unread scope.
+
 At sync and `show`, the reader reconciles their own `unread:<member>` label as a visible
 projection of that computation. Labels are created on demand; writers never set other readers'
 labels. The sender can inspect the recipient's last published read state with `list --sent` or

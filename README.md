@@ -114,6 +114,9 @@ content can be delivered by sync without triggering a check or heartbeat notific
    when you cease to be a party, before recipient-only delivery events are selected.
    Their versions and reusable unread results live in `activity.json` beside `state.json`;
    an unchanged tick makes one list query and no thread-history queries.
+   Changed threads are read in batches of 25 per GraphQL request, so a cold cache costs about one request
+   per 25 messages. A thread with more than 100 comments or timeline events, a batch that fails, and a
+   batched read older than the list read use the per-thread path with its timeline check.
 2. **Compare** each message's source version with the last delivered version. Timestamp ties
    compare the same observable fields; older timestamps neither hide nor replay updates. Delivery events remain recipient-only.
 3. **Write pending** (`pending.json`), then **emit** the events, then **commit** them to `state.json`

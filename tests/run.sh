@@ -6,7 +6,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 export STUB_DIR="$tmp/gh" STUB_LOG="$tmp/gh.log" PATH="$root/tests/stub:$PATH"
 export XDG_CONFIG_HOME="$tmp/config" XDG_STATE_HOME="$tmp/state"
-unset PARLEY_INBOX PARLEY_INTERVAL PARLEY_AXI PARLEY_OVERLAP PARLEY_CRASH_AT STUB_SYSTEMCTL STUB_READ_RACE STUB_TOUCH_LABELS STUB_EDIT_FAIL STUB_SAME_SECOND STUB_CRON_HOLD STUB_TIMELINE_RACE STUB_TIMELINE_STALE
+unset PARLEY_INBOX PARLEY_INTERVAL PARLEY_AXI PARLEY_OVERLAP PARLEY_CRASH_AT STUB_SYSTEMCTL STUB_READ_RACE STUB_TOUCH_LABELS STUB_EDIT_FAIL STUB_SAME_SECOND STUB_CRON_HOLD STUB_TIMELINE_RACE STUB_TIMELINE_STALE STUB_BATCH_FAIL
 export HOME="$tmp/home"
 mkdir -p "$HOME"
 mkdir -p "$STUB_DIR"
@@ -349,6 +349,28 @@ fresh; for i in $(seq 100 349); do rest "$i" open "2026-11-05T10:00:00Z" 0 "Ask 
 run sync --json
 expect "sync delivers all 250 messages across pages" '[[ $(jq "length" <<<"$out") -eq 250 && $(jq "[.[].number] | unique | length" <<<"$out") -eq 250 ]]' "$(head -c 300 <<<"$out")"
 run sync --verify; expect "verify sees all 250 as surfaced" '[[ $rc == 0 && $out == "verify: 250 message(s), all surfaced, states consistent" ]]' "$out"
+
+# detail requests follow the changed messages, not the size of the inbox
+calls() { grep -c "^$1" "$STUB_LOG" || true; }
+bump() { # <n>: bob adds a comment to message <n>
+  jq --argjson n "$1" 'map(if .number == $n then .updated_at = "2026-11-05T11:00:00Z" | .comments += 1 else . end)' "$team.issues.json" > "$tmp/bump.json" && mv "$tmp/bump.json" "$team.issues.json"
+  jq '.updatedAt = "2026-11-05T11:00:00Z" | .comments += [{id:"bob-reply",author:{login:"bob-gh"},createdAt:"2026-11-05T11:00:00Z",body:"Reply"}]' "$team.issue-$1.json" > "$tmp/bump.json" && mv "$tmp/bump.json" "$team.issue-$1.json"
+}
+unread_numbers() { "$px" list --unread --json | jq -c 'map(.number) | sort'; }
+fresh; for i in $(seq 100 159); do rest "$i" open 2026-11-05T10:00:00Z 0 "Ask $i" to:alice from:bob status:open; done | inbox "$team"
+reset; run sync --json
+expect "a cold sync of 60 messages reads their details in 3 requests" '[[ $(jq length <<<"$out") -eq 60 && $(calls "api graphql") -eq 3 && $(calls "issue view") -eq 0 ]]' "$(calls "api graphql") requests"
+expect "a cold sync leaves every new message unread" '[[ $(unread_numbers | jq length) -eq 60 ]]'
+"$px" show 130 >/dev/null; reset; run sync --json
+expect "an unchanged inbox needs no detail requests" '[[ $out == "[]" && $(calls "api graphql") -eq 0 && $(calls "issue view") -eq 0 ]]' "$out"
+expect "reading one message clears only its unread" '[[ $(unread_numbers | jq length) -eq 59 && $(unread_numbers | jq "index(130)") == null ]]'
+bump 130; reset; run sync --json
+expect "one changed message costs one detail request" '[[ $(jq -c "map(.number)" <<<"$out") == "[130]" && $(calls "api graphql") -eq 1 ]]' "$out $(calls "api graphql") requests"
+expect "the changed message is unread again, the others are untouched" '[[ $(unread_numbers | jq length) -eq 60 ]]'
+bump 131; reset; STUB_BATCH_FAIL=1 run sync --json
+expect "a failed batch falls back to one request set per message" '[[ $rc == 0 && $(jq -c "map(.number)" <<<"$out") == "[131]" && $(calls "api graphql") -eq 4 ]]' "$out $(calls "api graphql") requests"
+reset; run sync --json
+expect "after the fallback nothing is read again" '[[ $out == "[]" && $(calls "api graphql") -eq 0 ]]' "$out"
 
 # crash at each step: nothing is lost, and nothing repeats once a sync commits
 for step in write-pending emit commit swap; do

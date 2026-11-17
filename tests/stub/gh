@@ -19,6 +19,12 @@ done
 slug=${repo/\//__}
 emit() { if [ -n "$jqf" ]; then jq -r "$jqf"; else cat; fi; }
 field() { local f; for f in ${fields[@]+"${fields[@]}"}; do [[ $f == "$1="* ]] && echo "${f#*=}"; done; }
+view_of() { # <n>: the stored issue with defaults filled in
+  jq --arg id "issue-$slug-$1" --argjson n "$1" '.id //= $id | .number //= $n |
+    .author //= {login:"bob-gh"} | .body //= "" | .title //= "Message" |
+    .createdAt //= "2026-11-05T10:00:00Z" | .updatedAt //= .createdAt | .url //= "https://x" |
+    .comments //= [] | .comments |= (to_entries | map(.value + {id:(.value.id // ($id + "-comment-" + (.key|tostring)))}))' "$STUB_DIR/$slug.issue-$1.json"
+}
 touch_issue() {
   local f="$STUB_DIR/$slug.issue-$3.json" t seconds=1
   [ -f "$f" ] || return 0
@@ -43,12 +49,22 @@ case "$1 $2" in
         owner=$(field owner); name=$(field name); n=$(field number)
         query=$(field query)
         repo="$owner/$name"; slug=${repo/\//__}
+        if [[ $query == *"fragment T on Issue"* ]]; then
+          # batched details: one aliased issue per number, first pages only
+          [ -z "${STUB_BATCH_FAIL:-}" ] || { echo "batch failed" >&2; exit 1; }
+          for n in $(grep -o 'i[0-9]*: issue(number:[0-9]*)' <<<"$query" | grep -o '[0-9]*)$' | tr -d ')'); do
+            [ -f "$STUB_DIR/$slug.issue-$n.json" ] || { echo "missing issue $n" >&2; exit 1; }
+            view_of "$n" | jq -c --arg alias "i$n" --argjson stale "$([ "${STUB_TIMELINE_STALE:-}" = 1 ] && echo true || echo false)" '
+              if $stale then .updatedAt |= (fromdateiso8601 - 1 | todateiso8601) | .timeline = [] else . end |
+              . as $v | {($alias): (del(.comments, .edits, .timeline) + {labels:{nodes:.labels},
+                timelineItems:{pageInfo:{hasNextPage:false}, nodes:[($v.timeline // [])[] | select(.__typename != "RenamedTitleEvent")]},
+                comments:{pageInfo:{hasNextPage:false}, nodes:[$v.comments[]? | del(.edits)]}})}'
+          done | jq -sc '{data:{repository:add}}' | emit
+          exit 0
+        fi
         f="$STUB_DIR/$slug.issue-$n.json"
         if [ ! -f "$f" ]; then echo "missing issue $n" >&2; exit 1; fi
-        view=$(jq --arg id "issue-$slug-$n" --argjson n "$n" '.id //= $id | .number //= $n |
-          .author //= {login:"bob-gh"} | .body //= "" | .title //= "Message" |
-          .createdAt //= "2026-11-05T10:00:00Z" | .updatedAt //= .createdAt | .url //= "https://x" |
-          .comments //= [] | .comments |= (to_entries | map(.value + {id:(.value.id // ($id + "-comment-" + (.key|tostring)))}))' "$f")
+        view=$(view_of "$n")
         if [[ $query == *timelineItems* ]]; then
           if [ -n "${STUB_TIMELINE_RACE:-}${STUB_TIMELINE_STALE:-}" ]; then
             count=$(cat "$STUB_DIR/timeline-count" 2>/dev/null || echo 0)

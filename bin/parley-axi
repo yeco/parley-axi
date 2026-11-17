@@ -77,7 +77,8 @@ EOF
     sync) cat <<'EOT'
 usage: parley-axi sync [--json] [--no-commit] | sync --commit | sync --verify [--json]
 Delivers every message to you that is new or changed since the last sync (new message, new comments,
-status change, edit), at least once. One list query; only changed threads need unread detail queries.
+status change, edit), at least once. One list query; only changed threads need unread detail queries,
+read 25 per request.
 Edits can be delivered but do not mark unread. Stores unread results for list --unread, check and heartbeat. One line per event, or --json: [{...message, event, changes}].
 --no-commit prints the events but keeps them pending; sync --commit marks them delivered. Use the pair
 when something else has to show the events first, so a crash in between delivers them again.
@@ -295,6 +296,48 @@ fetch_issues() {
     jq -cs --arg me "$ME" --argjson l "$(jq -c .labels <<<"$CFG")" "$JQ_NORM map(norm(\$l))"
 }
 
+# JQ_THREAD: compose($comments; $timeline; $login) folds comments and status events into a thread's activity,
+# skipping the reader's own actions. Shared by fetch_thread and fetch_threads.
+# shellcheck disable=SC2016 # jq variables
+JQ_THREAD='def compose($comments; $timeline; $login):
+  .activity = ([.activity[], ($comments[] | {id, actor: .author.login}), $timeline[]] |
+    map(select((.actor // "" | ascii_downcase) != $login) | .id) | unique) | .comments = $comments;
+  def events($st): [.timelineItems.nodes[] | select(.label == null or (.label.name | startswith($st))) | {id, actor: .actor.login}];'
+
+# fetch_threads <n>...: details of several threads in one GraphQL request per 25. Prints {"<n>": thread} for each
+# thread whose first page of comments and timeline holds everything, shaped like fetch_thread's output. Threads
+# missing from it (long, or a failed request) are left to fetch_thread, which reports the real error.
+fetch_threads() {
+  local n login out="{}" batch next
+  login=$(jq -r --arg me "$ME" '.members[] | select(.id == $me) | .github | ascii_downcase' <<<"$CFG")
+  while [ $# -gt 0 ]; do
+    batch=""
+    for n in "${@:1:25}"; do batch+="i$n: issue(number:$n) { ...T } "; done
+    shift $(($# < 25 ? $# : 25))
+    if next=$(gh api graphql -f owner="${REPO%/*}" -f name="${REPO#*/}" -f query="query(\$owner:String!, \$name:String!) {
+      repository(owner:\$owner,name:\$name) { $batch } }
+      fragment T on Issue {
+        id number title body state createdAt updatedAt url author { login }
+        labels(first:100) { nodes { name } }
+        timelineItems(first:100,itemTypes:[CLOSED_EVENT,REOPENED_EVENT,LABELED_EVENT,UNLABELED_EVENT]) {
+          pageInfo { hasNextPage } nodes {
+            __typename
+            ... on ClosedEvent { id actor { login } }
+            ... on ReopenedEvent { id actor { login } }
+            ... on LabeledEvent { id actor { login } label { name } }
+            ... on UnlabeledEvent { id actor { login } label { name } }
+          }
+        }
+        comments(first:100) { pageInfo { hasNextPage } nodes { id body createdAt updatedAt author { login } } }
+      }" 2>/dev/null | jq -c --slurpfile out <(printf '%s\n' "$out") --arg login "$login" --arg st "$P_ST" "$JQ_THREAD"'
+      $out[0] + ([.data.repository // {} | .[] | select(. != null and (.timelineItems.pageInfo.hasNextPage | not) and
+        (.comments.pageInfo.hasNextPage | not)) | {key: (.number | tostring), value: (. as $i |
+        {id, number, title, body, state, createdAt, updatedAt, url, author, labels: .labels.nodes, activity: [{id, actor: .author.login}]} |
+        compose($i.comments.nodes; $i | events($st); $login))}] | from_entries)'); then out=$next; fi
+  done
+  printf '%s\n' "$out"
+}
+
 fetch_thread() {
   local n=$1 thread comments timeline login attempt
   login=$(jq -r --arg me "$ME" '.members[] | select(.id == $me) | .github | ascii_downcase' <<<"$CFG")
@@ -347,10 +390,8 @@ GRAPHQL
     }
 GRAPHQL
 )" | jq -cs '[.[].data.repository.issue.comments.nodes[]]') || return 1
-  jq -c --slurpfile comments <(printf '%s\n' "$comments") --slurpfile timeline <(printf '%s\n' "$timeline") --arg login "$login" '
-    .activity = ([.activity[], ($comments[0][] | {id, actor: .author.login}), $timeline[0][]] |
-      map(select((.actor // "" | ascii_downcase) != $login) | .id) | unique) |
-    .comments = $comments[0]' <<<"$thread"
+  jq -c --slurpfile comments <(printf '%s\n' "$comments") --slurpfile timeline <(printf '%s\n' "$timeline") --arg login "$login" \
+    "$JQ_THREAD"' compose($comments[0]; $timeline[0]; $login)' <<<"$thread"
 }
 
 thread_message() {
@@ -417,7 +458,7 @@ cache_thread() {
 }
 
 reconcile_updates() {
-  local n changed source thread candidates
+  local n changed source thread candidates prefetched
   jq -c --arg me "$ME" --slurpfile issues <(printf '%s\n' "$1") "$JQ_NORM
     reduce \$issues[0][] as \$issue (.; (\$issue.number | tostring) as \$key |
       .versions[\$key].version as \$known |
@@ -429,11 +470,16 @@ reconcile_updates() {
     (party(\$me) and newer(\$known.version)) as \$changed |
     select(\$changed or ((.unread | index(\$me) != null) != \$unread)) |
     [.number, \$changed] | @tsv" <<<"$1") || return 1
+  # Changed threads are read in batches; unchanged ones cost no detail request at all.
+  # shellcheck disable=SC2046 # issue numbers, no spaces
+  prefetched=$(fetch_threads $(awk -F'\t' '$2 == "true" {print $1}' <<<"$candidates")) || return 1
   while IFS=$'\t' read -r n changed; do
     [ -n "$n" ] || continue
     source=$(jq -c --argjson n "$n" '.[] | select(.number == $n)' <<<"$1") || return 1
     if [ "$changed" = true ]; then
-      thread=$(fetch_thread "$n" | thread_message) || return 1
+      # A batched thread older than the list read is stale: fetch_thread retries it and checks its timeline.
+      thread=$({ jq -ce --arg n "$n" --arg u "$(jq -r .updatedAt <<<"$source")" '.[$n] | select(. != null and .updatedAt >= $u)' \
+        <<<"$prefetched" || fetch_thread "$n"; } | thread_message) || return 1
       printf '%s\n' "$thread" | cache_thread "$source" || return 1
       publish_unread "$thread" || return 1
     else

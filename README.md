@@ -368,11 +368,15 @@ shellcheck bin/parley-axi checks/*.sh scripts/release.sh tests/run.sh tests/stub
 
 ## Releasing
 
-`scripts/release.sh` picks the next version by semver from the commits since the last release (the
-latest `v*` tag, or with no tags the commit that last changed `version` in `package.json`):
+Run `scripts/release.sh` from the repository root with Bash 4+, git, and GNU sed. A real release
+requires a clean working tree; `--dry-run` does not.
 
-- a breaking change (`!` after the type, or a `BREAKING CHANGE:` footer) is major, but minor while the
-  version is 0.x
+The script picks the next version using Conventional Commit markers and semver from the commits
+since the last release (the highest version-sorted `v*` tag, or with no tags the commit that last
+changed `version` in `package.json`):
+
+- a breaking change (`!` after the type or scope, or a `BREAKING CHANGE:` or `BREAKING-CHANGE:` footer)
+  is major, but minor while the version is 0.x
 - `feat` is minor
 - anything else (`fix`, `docs`, `no-mistakes(...)`) is patch
 - no commits since the last release: it stops with a message
@@ -385,6 +389,7 @@ git push origin main vX.Y.Z    # the script never pushes; the tag push publishes
 
 Pushing a `v*` tag runs `.github/workflows/publish.yml`: the same checks as the tests, a check that the
 tag is `v` plus the `version` in `package.json`, then `npm publish --provenance --access public`.
+Pushing only to `main` runs the tests workflow, not publication.
 
 One-time setup: on npmjs.com, open the `parley-axi` package, Settings, Trusted Publisher, and add
 this GitHub repository with the workflow filename `publish.yml`. No npm token is stored in GitHub.

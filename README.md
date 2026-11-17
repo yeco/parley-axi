@@ -366,6 +366,22 @@ bash tests/run.sh                                        # needs jq and Python 3
 shellcheck bin/parley-axi checks/*.sh tests/run.sh tests/stub/*
 ```
 
+## Releasing
+
+Pushing a version tag publishes to npm through `.github/workflows/publish.yml`. It runs the
+checks, confirms the tag is `v` plus the `version` in `package.json`, then runs
+`npm publish --provenance --access public`.
+
+```bash
+# bump "version" in package.json, then:
+git commit -am "chore: release 0.1.1"
+git tag v0.1.1
+git push origin v0.1.1
+```
+
+One-time setup: on npmjs.com, open the `parley-axi` package, Settings, Trusted Publisher, and add
+this GitHub repository with the workflow filename `publish.yml`. No npm token is stored in GitHub.
+
 ## License
 
 [MIT](LICENSE)

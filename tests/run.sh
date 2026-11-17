@@ -463,6 +463,37 @@ run schedule install --every 1h --notify 'true'
 expect "cron install works with an empty crontab" '[[ $rc == 0 ]] && cron_contract "[$(cron_entry "0 */1 * * *" "$runner" parley-axi:team-parley:alice)]"' "$out"
 run schedule remove
 
+# --- release version picking (scripts/release.sh)
+rel() { # <subject> [body]: commit on top of the scratch release repo
+  git -C "$tmp/rel" commit -q --allow-empty -m "$1" ${2:+-m "$2"}
+}
+relrepo() { # <package.json version> [tag]: fresh scratch repo with a first commit
+  rm -rf "$tmp/rel"; mkdir "$tmp/rel"
+  git -C "$tmp/rel" init -q
+  git -C "$tmp/rel" config user.email t@example.com; git -C "$tmp/rel" config user.name t
+  printf '{\n  "name": "x",\n  "version": "%s"\n}\n' "$1" > "$tmp/rel/package.json"
+  git -C "$tmp/rel" add package.json; rel "chore: init"
+  [ -z "${2:-}" ] || git -C "$tmp/rel" tag "$2"
+}
+relrun() { out=$(cd "$tmp/rel" && GIT_CONFIG_COUNT=0 bash "$root/scripts/release.sh" "$@" 2>&1); rc=$?; }
+relrepo 0.1.0; relrun --dry-run
+expect "release stops when nothing changed since the last release" '[[ $rc != 0 && $out == *"nothing to release"* ]]' "$out"
+rel "fix: a bug"; rel "docs: words"; relrun --dry-run
+expect "release: fix and docs are patch" '[[ $rc == 0 && $out == v0.1.1* ]]' "$out"
+rel "feat: a thing"; relrun --dry-run
+expect "release: feat is minor" '[[ $out == v0.2.0* ]]' "$out"
+rel "refactor(core)!: drop it"; relrun --dry-run
+expect "release: breaking bang on 0.x is minor" '[[ $out == v0.2.0* ]]' "$out"
+relrepo 0.1.0; rel "fix: x" "BREAKING CHANGE: gone"; relrun --dry-run
+expect "release: BREAKING CHANGE footer on 0.x is minor" '[[ $out == v0.2.0* ]]' "$out"
+relrepo 1.4.2 v1.4.2; rel "feat: a"; rel "feat!: b"; relrun --dry-run
+expect "release: breaking on 1.x is major, measured from the latest tag" '[[ $out == v2.0.0* ]]' "$out"
+relrepo 1.4.2 v1.4.2; rel "no-mistakes(review): tidy"; relrun
+expect "release: real run bumps package.json, commits and tags" \
+  '[[ $rc == 0 && $(git -C "$tmp/rel" tag --list v1.4.3) == v1.4.3 && $(git -C "$tmp/rel" log -1 --format=%s) == "chore(release): v1.4.3" ]] && grep -q "\"version\": \"1.4.3\"" "$tmp/rel/package.json"' "$out"
+relrun --dry-run
+expect "release: nothing to release right after a release" '[[ $rc != 0 ]]' "$out"
+
 python3 "$root/tests/review.py" || fails=$((fails + 1))
 
 echo; [ "$fails" = 0 ] && echo "all passed" || { echo "$fails failed"; exit 1; }

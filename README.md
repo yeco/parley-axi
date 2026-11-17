@@ -363,21 +363,28 @@ what is being asked, and drafts the reply.
 
 ```bash
 bash tests/run.sh                                        # needs jq and Python 3; stubbed gh, no network
-shellcheck bin/parley-axi checks/*.sh tests/run.sh tests/stub/*
+shellcheck bin/parley-axi checks/*.sh scripts/release.sh tests/run.sh tests/stub/*
 ```
 
 ## Releasing
 
-Pushing a version tag publishes to npm through `.github/workflows/publish.yml`. It runs the
-checks, confirms the tag is `v` plus the `version` in `package.json`, then runs
-`npm publish --provenance --access public`.
+`scripts/release.sh` picks the next version by semver from the commits since the last release (the
+latest `v*` tag, or with no tags the commit that last changed `version` in `package.json`):
+
+- a breaking change (`!` after the type, or a `BREAKING CHANGE:` footer) is major, but minor while the
+  version is 0.x
+- `feat` is minor
+- anything else (`fix`, `docs`, `no-mistakes(...)`) is patch
+- no commits since the last release: it stops with a message
 
 ```bash
-# bump "version" in package.json, then:
-git commit -am "chore: release 0.1.1"
-git tag v0.1.1
-git push origin v0.1.1
+scripts/release.sh --dry-run   # print the next version and the commit that decided it
+scripts/release.sh             # bump package.json, commit "chore(release): vX.Y.Z", tag vX.Y.Z
+git push origin main vX.Y.Z    # the script never pushes; the tag push publishes
 ```
+
+Pushing a `v*` tag runs `.github/workflows/publish.yml`: the same checks as the tests, a check that the
+tag is `v` plus the `version` in `package.json`, then `npm publish --provenance --access public`.
 
 One-time setup: on npmjs.com, open the `parley-axi` package, Settings, Trusted Publisher, and add
 this GitHub repository with the workflow filename `publish.yml`. No npm token is stored in GitHub.

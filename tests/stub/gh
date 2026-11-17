@@ -52,9 +52,9 @@ case "$1 $2" in
         if [[ $query == *"fragment T on Issue"* ]]; then
           # batched details: one aliased issue per number, first pages only
           [ -z "${STUB_BATCH_FAIL:-}" ] || { echo "batch failed" >&2; exit 1; }
-          for n in $(grep -o 'i[0-9]*: issue(number:[0-9]*)' <<<"$query" | grep -o '[0-9]*)$' | tr -d ')'); do
-            [ -f "$STUB_DIR/$slug.issue-$n.json" ] || { echo "missing issue $n" >&2; exit 1; }
-            view_of "$n" | jq -c --arg alias "i$n" --argjson stale "$([ "${STUB_TIMELINE_STALE:-}" = 1 ] && echo true || echo false)" '
+          for batch_n in $(grep -o 'i[0-9]*: issue(number:[0-9]*)' <<<"$query" | grep -o '[0-9]*)$' | tr -d ')'); do
+            [ -f "$STUB_DIR/$slug.issue-$batch_n.json" ] || { echo "missing issue $batch_n" >&2; exit 1; }
+            view_of "$batch_n" | jq -c --arg alias "i$batch_n" --argjson stale "$([ "${STUB_TIMELINE_STALE:-}" = 1 ] && echo true || echo false)" '
               if $stale then .updatedAt |= (fromdateiso8601 - 1 | todateiso8601) | .timeline = [] else . end |
               . as $v | {($alias): (del(.comments, .edits, .timeline) + {labels:{nodes:.labels},
                 timelineItems:{pageInfo:{hasNextPage:false}, nodes:[($v.timeline // [])[] | select(.__typename != "RenamedTitleEvent")]},

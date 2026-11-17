@@ -72,9 +72,11 @@ repository selects separate receipts, activity, pending delivery, and cursors; s
 reuses that repository's state. A new repository without receipts treats other-author history
 as unread, including closed threads.
 
-Thread metadata is fetched before activity. Every timeline page must report the same issue
-`updatedAt` as that metadata; a mismatch retries the observation once. A second mismatch fails
-without saving that observation as a receipt or cached version. If the post-print refresh fails,
+For `show` and the [per-thread sync fallback](#delivery-on-the-receiving-side), thread metadata
+is fetched before activity. Every timeline page must report the same issue `updatedAt` as that
+metadata; a mismatch retries the observation once. A second mismatch fails without saving that
+observation as a receipt or cached version. Batched sync reads metadata and activity in the same
+GraphQL response rather than checking separately fetched timeline pages. If the post-print refresh fails,
 the receipt for the already printed, consistent snapshot remains valid, but no newer cache version
 is committed; a later successful sync can discover the unprinted transition.
 
@@ -114,8 +116,9 @@ content can be delivered by sync without triggering a check or heartbeat notific
    when you cease to be a party, before recipient-only delivery events are selected.
    Their versions and reusable unread results live in `activity.json` beside `state.json`;
    an unchanged tick makes one list query and no thread-history queries.
-   Changed threads are read in batches of 25 per GraphQL request, so a cold cache costs about one request
-   per 25 messages. A thread with more than 100 comments or timeline events, a batch that fails, and a
+   Changed threads are read in batches of 25 per GraphQL request, so a cold cache costs about one detail
+   request per 25 messages, in addition to listing and unread-label publication. A thread with more than
+   100 comments or the queried close/reopen and label timeline events, a batch that fails, and a
    batched read older than the list read use the per-thread path with its timeline check.
 2. **Compare** each message's source version with the last delivered version. Timestamp ties
    compare the same observable fields; older timestamps neither hide nor replay updates. Delivery events remain recipient-only.

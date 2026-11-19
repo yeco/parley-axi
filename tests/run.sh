@@ -126,7 +126,7 @@ run inboxes; expect "inboxes lists all, marks default" '[[ $out == *"team-parley
 # --- send
 reset; run send --to bob --subject "Check this" --body "Please look" --link https://example.com/pr/1 --due 2026-11-10
 expect "send prints number and url" '[[ $out == "sent #42 to bob: https://github.com/acme/team-parley/issues/42" ]]' "$out"
-expect "send leaves unread projection to readers" '! logged "--label unread:" && ! logged "label create unread:"' "$(cat "$STUB_LOG")"
+expect "send raises the recipient's unread flag" 'logged "label create unread:bob" && logged "--label status:open --label unread:bob"' "$(cat "$STUB_LOG")"
 for want in "--label to:bob" "--label from:alice" "--label status:open" "--title Check this" "Please look" "- https://example.com/pr/1" "Due: 2026-11-10"; do
   expect "send passes '$want'" 'logged "$want"' "$(cat "$STUB_LOG")"
 done
@@ -147,7 +147,7 @@ reset; run --as bob send --to alice --subject s; expect "--as overrides the conf
 # --- multiple inboxes
 reset; run --inbox ops send --to carol --subject s
 expect "--inbox picks the repo and its labels" '[[ $rc == 0 && $out == *acme/ops-parley* ]] && logged "issue create -R acme/ops-parley" && logged "--label for/carol --label by/alice --label state/new"' "$(cat "$STUB_LOG")"
-expect "custom send leaves unread projection to readers" '! logged "--label unseen/"'
+expect "custom send raises the recipient's flag with the custom prefix" 'logged "--label state/new --label unseen/carol"'
 reset; run send --to carol --subject s --inbox ops; expect "--inbox works after the command" '[[ $rc == 0 ]] && logged "-R acme/ops-parley"'
 reset; out=$(PARLEY_INBOX=ops "$px" send --to carol --subject s 2>&1); expect "PARLEY_INBOX picks the inbox" 'logged "-R acme/ops-parley"'
 run --inbox nope list; expect "unknown inbox fails" '[[ $rc != 0 && $out == *"unknown inbox"* ]]'
@@ -191,7 +191,7 @@ while read -r st cmd want; do
   expect "$st + $cmd -> $want" '[[ $rc == 0 && $out == "#20 $st -> $want" ]]' "$out"
   expect "$st + $cmd records the transition" 'logged "parley: $st -> $want by alice" && logged "<!-- parley-transition {\"v\":1,\"from\":\"$st\",\"to\":\"$want\",\"by\":\"alice\"} -->"' "$(cat "$STUB_LOG")"
   expect "$st + $cmd swaps the status label" 'logged "issue edit 20 -R acme/team-parley --add-label status:$want --remove-label status:$st"'
-  expect "$st + $cmd leaves unread projection to readers" '! logged "--add-label unread:"'
+  expect "$st + $cmd raises the other party's flag in the status edit" 'logged "--remove-label status:$st --add-label unread:bob" && ! logged "unread:alice"'
   case $want in
     done|declined) expect "$st + $cmd closes" 'logged "issue close 20" && ! logged "issue reopen"' ;;
     open) expect "$st + $cmd reopens" 'logged "issue reopen 20" && ! logged "issue close"' ;;
@@ -273,22 +273,45 @@ jq '[{number:30,title:"Review the PR",state:"open",comments:1,created_at:.create
 reset; STUB_READ_RACE=1 run --as bob show 30
 "$px" --as bob sync --no-commit >/dev/null
 run --as bob list --unread --json
-expect "show preserves unread when content changes while reading" '[[ $rc == 0 ]] && logged "--add-label unread:bob"' "$(cat "$STUB_LOG")"
+expect "unflagged activity that lands while reading stays unread from receipts" '[[ $rc == 0 ]] && jq -e "map(.number) == [30]" <<<"$out" >/dev/null' "$out"
+expect "sync never raises the reader's own flag" '! logged "--add-label unread:bob"' "$(cat "$STUB_LOG")"
+jq '.labels += [{name:"unread:bob"}]' "$team.issue-30.json" > "$tmp/read.json"; mv "$tmp/read.json" "$team.issue-30.json"
 (bash "$px" --as bob show 30 >&-) 2>/dev/null; rc=$?
-expect "failed show output does not mark read" '[[ $rc != 0 ]] && jq -e "any(.labels[]; .name == \"unread:bob\")" "$team.issue-30.json" >/dev/null'
+expect "failed show output does not lower the flag" '[[ $rc != 0 ]] && jq -e "any(.labels[]; .name == \"unread:bob\")" "$team.issue-30.json" >/dev/null'
 jq '.body = "Please look"' "$team.issue-30.json" > "$tmp/read.json"; mv "$tmp/read.json" "$team.issue-30.json"
 jq '.labels += [{name:"unread:alice"}]' "$team.issue-30.json" > "$tmp/read.json"; mv "$tmp/read.json" "$team.issue-30.json"
 reset; "$px" show 30 --json >/dev/null; expect "show --json clears reader unread" 'logged "--remove-label unread:alice"'
 reset; "$px" reply 30 hello there >/dev/null; expect "reply comments" 'logged "issue comment 30 -R acme/team-parley --body hello there"'
-expect "reply leaves unread projection to readers" '! logged "--add-label unread:"'
+expect "recipient reply raises the sender's flag after commenting, never its own" '[[ $(grep -n "issue comment 30" "$STUB_LOG" | cut -d: -f1) -lt $(grep -n "issue edit 30 -R acme/team-parley --add-label unread:bob" "$STUB_LOG" | cut -d: -f1) ]] && ! logged "unread:alice"' "$(cat "$STUB_LOG")"
 reset; run --as bob reply 30 response
-expect "sender reply leaves unread projection to readers" '[[ $rc == 0 ]] && ! logged "--add-label unread:"'
+expect "sender reply raises the recipient's flag" '[[ $rc == 0 ]] && logged "issue edit 30 -R acme/team-parley --add-label unread:alice" && ! logged "unread:bob"' "$(cat "$STUB_LOG")"
+reset; STUB_EDIT_FAIL=1 run --as bob reply 30 again
+expect "a reply whose flag fails says so" '[[ $rc != 0 && $out == *"replied on #30, but raising unread:alice failed"* ]]' "$out"
 issue "$team" 31 OPEN to:alice from:alice status:open
 reset; run reply 31 note
 expect "self-reply never marks unread" '[[ $rc == 0 ]] && ! logged "--add-label unread:"'
 reset; echo "from stdin" | "$px" reply 30 - >/dev/null; expect "reply reads stdin" 'logged "--body from stdin"'
 issue "$team" 13 OPEN to:bob from:bob status:open
 run reply 13 hi; expect "reply on a stranger's thread fails" '[[ $rc != 0 && $out == *"not you"* ]]'
+
+# --- mailbox flag: writers raise the other party's unread:<member>, show lowers your own
+issue "$team" 32 OPEN to:alice from:bob status:open unread:alice
+rm -f "$STUB_DIR/timeline-count"; reset; STUB_TIMELINE_RACE=after-first run show 32
+expect "show keeps the flag when other-party activity lands after the printed snapshot" '[[ $rc == 0 ]] && ! logged "--remove-label unread:alice" && jq -e "any(.labels[]; .name == \"unread:alice\")" "$team.issue-32.json" >/dev/null' "$out"
+rm -f "$STUB_DIR/timeline-count"; reset; run show 32
+expect "the next show lowers it" '[[ $rc == 0 ]] && logged "issue edit 32 -R acme/team-parley --remove-label unread:alice"' "$out"
+issue "$team" 34 CLOSED to:alice from:bob status:done
+reset; run --as bob reopen 34
+expect "a status change by the other party raises your flag" '[[ $rc == 0 ]] && logged "--add-label status:open --remove-label status:done --add-label unread:alice" && ! logged "unread:bob"' "$(cat "$STUB_LOG")"
+issue "$team" 35 OPEN to:alice from:alice status:open
+reset; run ack 35
+expect "a transition on a thread with yourself raises no flag" '[[ $rc == 0 ]] && ! logged "unread:"' "$(cat "$STUB_LOG")"
+rest 33 open 2026-11-05T10:00:00Z 0 "Before edit" to:alice from:bob status:open | inbox "$team"
+"$px" sync >/dev/null; "$px" show 33 >/dev/null
+rest 33 open 2026-11-05T10:05:00Z 0 "After edit" to:alice from:bob status:open | inbox "$team"
+reset; run sync
+expect "sync delivers an edit without raising or lowering any flag" '[[ $out == *"#33 updated (edited)"* ]] && ! logged "issue edit" && ! logged "label create"' "$out"
+run list --unread --json; expect "an edit does not mark unread" 'jq -e "map(.number) | index(33) == null" <<<"$out" >/dev/null' "$out"
 
 # --- delivery: sync keeps a cursor and per-message versions, and delivers at least once
 st="$XDG_STATE_HOME/parley-axi/team-parley/alice/acme:team-parley"

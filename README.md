@@ -23,10 +23,11 @@ agent the same small inbox: a shared GitHub repo where one issue is one message.
 
 A message is an issue with three labels: who it is for (`to:bob`), who sent it (`from:alice`)
 and exactly one status (`status:open`, `status:acknowledged`, `status:done` or `status:declined`).
-Replies are comments. A separate `unread:<member>` label records who has not read the latest
-activity. It is independent of the issue's status and whether the issue is open or closed.
+Replies are comments. A separate `unread:<member>` label is that member's mailbox flag: the
+other party raises it when they send, reply or change the status, and the member lowers it by
+reading. It is independent of the issue's status and whether the issue is open or closed.
 
-## Lifecycle, read receipts, and delivery
+## Lifecycle, the unread flag, and delivery
 
 parley tracks message lifecycle, reading, and delivery independently.
 
@@ -54,18 +55,36 @@ Every transition is recorded in the repo, so the history can be rebuilt from the
 - A transition writes the record first, then closes or reopens, then swaps the label. The label is
   the commit point: if a step fails, the same command is still legal and rerunning it finishes it.
 
-### Read receipts (independent of lifecycle and delivery)
+### The unread flag (independent of lifecycle and delivery)
 
-Each reader computes unread from activity by other GitHub authors that is absent from their
-local read receipt. Only new messages, new comments (including replies and transition comments),
-status-label changes, and close/reopen transitions made through either Parley or GitHub trigger unread.
-Edits to existing bodies, titles, or comments do not mark unread. Incoming and
-sent threads are checked, including closed ones. Your own activity neither makes a thread unread
-for you nor clears unseen activity from others. Only the sender and recipient are notified.
+`unread:<member>` works like the flag on a mailbox: whoever drops mail raises it, and whoever
+lives there lowers it after reading. The writer raises it, the reader lowers it:
+
+- `send` creates the issue with `unread:<recipient>` already on it.
+- `reply` posts the comment, then raises the other party's flag.
+- `ack`, `done`, `decline` and `reopen` raise the other party's flag in the same edit that swaps
+  the status label.
+- `show <n>` lowers your own flag, and only yours.
+
+Your own activity never raises your own flag, and a thread with yourself raises none. Edits to
+existing bodies, titles or comments never raise it. Labels are created on demand by the writer
+that raises them. The sender sees whether the recipient has read the latest activity with
+`list --sent` or `show`, the moment the flag goes up or down. `sync` never changes labels.
 
 `show <n>` prints a content snapshot, including with `--json`, then durably records exactly the
-other-author activity represented in that snapshot. Concurrent activity not printed remains
-unread. Receipts live beside the sync cursor in
+other-party activity represented in that snapshot as a local read receipt. It then fetches the
+thread again and lowers your flag only when nothing from the other party arrived after the printed
+snapshot; a reply that lands while you read keeps the flag up. If lowering fails, the flag stays up
+and the message stays unread until your next `show`.
+
+For you, a thread is unread when your flag is up, or when your local receipts miss activity by
+another GitHub author: a new comment, a status-label change, or a close/reopen made through either
+Parley or GitHub. The receipts are a backstop for activity that arrived without a flag: a raw
+GitHub comment, a raise that failed, a flag lowered in a race with a new reply, or a party still on
+an older parley-axi. Incoming and sent threads are checked, including closed ones. Only the sender
+and recipient are notified.
+
+Receipts live beside the sync cursor in
 `$XDG_STATE_HOME/parley-axi/<inbox>/<member>/<owner>:<repo>/read.json`; keep this state to preserve read history.
 Repository names are case-normalized in the state path. Reassigning an inbox alias to another
 repository selects separate receipts, activity, pending delivery, and cursors; switching back
@@ -75,24 +94,24 @@ as unread, including closed threads.
 For `show` and the [per-thread sync fallback](#delivery-on-the-receiving-side), thread metadata
 is fetched before activity. Every timeline page must report the same issue `updatedAt` as that
 metadata; a mismatch retries the observation once. A second mismatch fails without saving that
-observation as a receipt or cached version. Batched sync reads metadata and activity in the same
-GraphQL response rather than checking separately fetched timeline pages. If the post-print refresh fails,
-the receipt for the already printed, consistent snapshot remains valid, but no newer cache version
-is committed; a later successful sync can discover the unprinted transition.
+observation as a receipt or cached version, and leaves the flag up. Batched sync reads metadata and
+activity in the same GraphQL response rather than checking separately fetched timeline pages. If the
+post-print refresh fails, the receipt for the already printed, consistent snapshot remains valid,
+but no newer cache version is committed and the flag stays up; a later successful sync can discover
+the unprinted transition.
 
 Known limit: this bounded timestamp check is not an atomic GitHub snapshot. Same-second status
 changes or eventual timeline indexing can evade it; timestamps alone cannot prove that every
-activity event is visible. Existing body, title, and comment edits remain outside unread scope.
+activity event is visible. Removing a label is not conditional either, so a reply that lands between
+the refetch and the removal loses its flag; your receipts still report it unread.
 
-At sync and `show`, the reader reconciles their own `unread:<member>` label as a visible
-projection of that computation. Labels are created on demand; writers never set other readers'
-labels. The sender can inspect the recipient's last published read state with `list --sent` or
-`show`. Projection can lag until the recipient next syncs. `show` publishes after recording its
-receipt and preserves the other party's label; its JSON is the printed snapshot before receipt.
-The local receipt remains authoritative if label publication fails: cached listing immediately
-reflects the read, and the next sync retries the mismatched projection without rereading history,
-even when that cached thread is older than the incremental query's overlap window. Successful
-publication updates the cached projection so an unchanged sync does not republish it.
+**Upgrading.** Earlier versions had each reader raise and clear their own flag as their client
+noticed activity, so a thread's timeline showed the recipient labelling themselves. Existing threads
+keep their labels and nothing is relabelled. A party still on an older version reads normally: their
+`show` lowers the flag you raised, and their client may still raise and clear its own flag as it
+syncs, which is harmless. Their replies and transitions do not raise yours: your receipts still
+report them unread in `list --unread`, the check and the heartbeat, but GitHub shows no
+`unread:<you>` for them.
 
 `list --unread` reads the stored result from the latest sync/show without GitHub calls; run
 `sync` first to refresh it. The check and heartbeat sync once, then reuse that same result.
@@ -117,7 +136,7 @@ content can be delivered by sync without triggering a check or heartbeat notific
    Their versions and reusable unread results live in `activity.json` beside `state.json`;
    an unchanged tick makes one list query and no thread-history queries.
    Changed threads are read in batches of 25 per GraphQL request, so a cold cache costs about one detail
-   request per 25 messages, in addition to listing and unread-label publication. A thread with more than
+   request per 25 messages, in addition to listing. A thread with more than
    100 comments or the queried close/reopen and label timeline events, a batch that fails, and a
    batched read older than the list read use the per-thread path with its timeline check.
 2. **Compare** each message's source version with the last delivered version. Timestamp ties
@@ -125,7 +144,7 @@ content can be delivered by sync without triggering a check or heartbeat notific
 3. **Write pending** (`pending.json`), then **emit** the events, then **commit** them to `state.json`
    with an atomic rename.
 
-Local state initialization, receipt merges, reconciliation, and delivery commits share a
+Local state initialization, receipt merges, cache refreshes, and delivery commits share a
 `flock` lock per inbox/member/repository. Receipts and cached results use uniquely named temporary files
 and atomic replacement, so concurrent readers preserve each other's receipts. State locks
 release when the owning process exits, including on crashes.
@@ -135,8 +154,8 @@ same events again. Once a sync commits, nothing repeats. The first sync delivers
 closed ones from before it are history. `sync --no-commit` and `sync --commit` split emitting
 from committing for a caller that must show the events before they count as delivered. The check
 and heartbeat use that pair, committing only after successful output or notification. They select
-notifications by reconciled read receipts rather than delivery timestamps, so self-authored
-updates do not wake you. Unread persists after delivery commits; subsequent ticks retry until `show`.
+notifications by the unread flag and read receipts rather than delivery timestamps, so
+self-authored updates do not wake you. Unread persists after delivery commits; subsequent ticks retry until `show`.
 
 `parley-axi sync --verify` checks every message to you against the local delivery state and lists
 any message never surfaced, any newer source version not surfaced, and any broken status (no status
@@ -237,7 +256,7 @@ output. It is safe to run every minute:
 - It runs `parley-axi sync --no-commit`, then `list --unread`, prints at most one line, and only
   then commits. For example
   `parley: 2 unread message(s): #7 unread from bob: Review the PR; #8 unread from bob: Second ask - read with: parley-axi show <n>`.
-- It repeats while unread remains, using the [read-receipt rules](#read-receipts-independent-of-lifecycle-and-delivery).
+- It repeats while unread remains, using the [unread-flag rules](#the-unread-flag-independent-of-lifecycle-and-delivery).
 - It prints nothing and exits 0 when gh or the network fails, and wraps the call in `timeout`
   (or `gtimeout`) when one is installed.
 
@@ -272,7 +291,7 @@ branch, which an empty repo needs) and creates the routing and status labels. Me
 everyone runs `setup`, which checks membership and those labels. Running `init` again is safe:
 it keeps an existing config, reuses an open init PR, and creates or updates those labels. After
 you edit `.parley.json` (a new member, a new color), run `init` again to sync them. Unread labels
-follow the separate [reader-owned publication rules](#read-receipts-independent-of-lifecycle-and-delivery).
+are created on demand by the writer that raises them (see [the unread flag](#the-unread-flag-independent-of-lifecycle-and-delivery)).
 
 ## Inbox repo config reference
 
@@ -356,7 +375,7 @@ These rules are the point of the tool. Put them in your agent's instructions.
   The agent reports the ask to its person and acts only on what that person approves.
 - **Agents draft, people send.** An agent drafts replies, `done` notes and `decline` reasons and
   shows them to its person before sending.
-- **Read, then acknowledge early.** Follow the [read-receipt rules](#read-receipts-independent-of-lifecycle-and-delivery),
+- **Read, then acknowledge early.** Follow the [unread-flag rules](#the-unread-flag-independent-of-lifecycle-and-delivery),
   then use `ack` to acknowledge the request.
 - **Close the loop.** Follow the [message lifecycle](#the-message-lifecycle-in-the-inbox-repo)
   for when to resolve a message and who can do so.

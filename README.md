@@ -144,7 +144,7 @@ content can be delivered by sync without triggering a check or heartbeat notific
 3. **Write pending** (`pending.json`), then **emit** the events, then **commit** them to `state.json`
    with an atomic rename.
 
-Local state initialization, receipt merges, reconciliation, and delivery commits share a
+Local state initialization, receipt merges, cache refreshes, and delivery commits share a
 `flock` lock per inbox/member/repository. Receipts and cached results use uniquely named temporary files
 and atomic replacement, so concurrent readers preserve each other's receipts. State locks
 release when the owning process exits, including on crashes.

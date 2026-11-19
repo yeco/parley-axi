@@ -25,7 +25,7 @@ help_for() {
 usage: parley-axi init --repo <owner/name> [--member <id>[:<github-login>[:<Display Name>]]]... [--direct]
 Writes a starter .parley.json to the inbox repo and creates its routing and status labels. Idempotent:
 an existing .parley.json is kept as is, an open init PR is reused, and routing/status labels are created or updated.
-Unread labels are created on demand by readers.
+Unread labels are created on demand by the writer that raises them.
 Default: opens a PR from branch parley-init. --direct: commits straight to the default branch.
 Without --member, the starter config has one member: your gh login.
 EOF
@@ -33,14 +33,14 @@ EOF
     setup) cat <<'EOF'
 usage: parley-axi setup --repo <owner/name> --as <member-id> [--name <inbox>] [--default]
 Saves an inbox to the local config after checking membership and that routing and status labels exist.
-Unread labels are created on demand by readers.
+Unread labels are created on demand by the writer that raises them.
 --name defaults to the repo name. The first inbox you set up becomes the default; --default switches it.
 EOF
     ;;
     inboxes) echo "usage: parley-axi inboxes [--json]   Lists the configured inboxes: name repo member (* marks the default)." ;;
     send) cat <<'EOF'
 usage: parley-axi send --to <member-id> --subject <s> [--body <text>|--body-file <file|->] [--link <url>]... [--due YYYY-MM-DD] [--json]
-Creates one issue labelled with to, from and open-status. Readers reconcile unread labels.
+Creates one issue labelled with to, from, open-status and unread:<to>, the recipient's mailbox flag.
 Body text comes first, then links and due date.
 EOF
     ;;
@@ -48,17 +48,18 @@ EOF
 usage: parley-axi list [--all] [--sent] [--unread] [--json]
 Default: open messages addressed to you. --sent: messages you sent. --all: include closed ones.
 --unread: cached unread from the latest sync/show, including sent and closed threads; does not mark read.
+Unread for you means your unread:<you> flag is up, or your local receipts miss other-party activity.
 Run sync to refresh unread before listing; unread listing itself makes no GitHub calls.
-Only new messages, new comments and other-party status transitions mark unread; edits do not.
+send, reply and status transitions raise the other party's flag; edits do not.
 Unread labels in list/show tell the sender who has not read the latest activity.
 Lines: #number from:<who> <status> <age> "subject" url   (--sent shows to:<who>)
 --json: [{number,subject,from,to,status,unread,unreadFrom,state,comments,createdAt,updatedAt,url}], newest update first.
 status is the lifecycle state (open, acknowledged, done, declined), or none/conflict/unknown when the labels are broken.
 EOF
     ;;
-    show) echo "usage: parley-axi show <n> [--json]   Prints the message header, body and comments, then clears your unread marker. Inconsistent metadata/activity retries once, then fails without saving that observation. Edits do not mark unread. Sender or recipient only." ;;
-    reply) echo "usage: parley-axi reply <n> <text>|-   Adds a comment; the other party detects unread activity on sync. '-' reads stdin. Sender or recipient only." ;;
-    ack) echo "usage: parley-axi ack <n>   Recipient only. open -> acknowledged." ;;
+    show) echo "usage: parley-axi show <n> [--json]   Prints the message header, body and comments, then lowers your unread flag unless other-party activity arrived after what was printed. Inconsistent metadata/activity retries once, then fails without saving that observation. Edits do not mark unread. Sender or recipient only." ;;
+    reply) echo "usage: parley-axi reply <n> <text>|-   Adds a comment, then raises the other party's unread flag. '-' reads stdin. Sender or recipient only." ;;
+    ack) echo "usage: parley-axi ack <n>   Recipient only. open -> acknowledged. Every transition raises the other party's unread flag." ;;
     done) echo "usage: parley-axi done <n> [note]   Sender or recipient. open|acknowledged -> done, closes the issue. Either party should mark done when nothing actionable is left: the question answered and applied, or the request fulfilled." ;;
     decline) echo "usage: parley-axi decline <n> <reason>   Recipient only. open|acknowledged -> declined, closes the issue." ;;
     reopen) echo "usage: parley-axi reopen <n> [note]   Sender or recipient. done|declined -> open, reopens the issue." ;;
@@ -79,7 +80,7 @@ usage: parley-axi sync [--json] [--no-commit] | sync --commit | sync --verify [-
 Delivers every message to you that is new or changed since the last sync (new message, new comments,
 status change, edit), at least once. One list query; only changed threads need unread detail queries,
 read 25 per request.
-Edits can be delivered but do not mark unread. Stores unread results for list --unread, check and heartbeat. One line per event, or --json: [{...message, event, changes}].
+Edits can be delivered but do not mark unread. Sync never changes labels. Stores unread results for list --unread, check and heartbeat. One line per event, or --json: [{...message, event, changes}].
 --no-commit prints the events but keeps them pending; sync --commit marks them delivered. Use the pair
 when something else has to show the events first, so a crash in between delivers them again.
 --verify compares the local delivery state with the repo and lists any message never surfaced and any
@@ -242,6 +243,14 @@ need_recipient() {
   [ "$(label_val "$P_TO")" = "$ME" ] || die "#$1 is addressed to $(label_val "$P_TO"), not to you ($ME)"
 }
 
+# other_party: the party whose mailbox flag your activity raises; empty on a thread with yourself.
+other_party() {
+  local to from
+  to=$(label_val "$P_TO") from=$(label_val "$P_FROM")
+  if [ "$to" = "$from" ]; then return 0; fi
+  if [ "$to" = "$ME" ]; then echo "$from"; else echo "$to"; fi
+}
+
 status_label() {
   case $1 in open) echo "$P_ST$S_OPEN" ;; acknowledged) echo "$P_ST$S_ACK" ;; done) echo "$P_ST$S_DONE" ;; declined) echo "$P_ST$S_DECL" ;; esac
 }
@@ -266,12 +275,14 @@ ensure_unread_label() {
     --description "Unread for $1" --force >/dev/null
 }
 
-# set_status <n> <label>: leaves exactly one status label on the issue.
+# set_status <n> <label> [member]: leaves exactly one status label on the issue and, in the same edit,
+# raises <member>'s unread flag.
 set_status() {
   local args=(--add-label "$2") l
   while IFS= read -r l; do
     if [[ $l == "$P_ST"* && $l != "$2" ]]; then args+=(--remove-label "$l"); fi
   done <<<"$LABELS"
+  if [ -n "${3:-}" ]; then ensure_unread_label "$3"; args+=(--add-label "$P_UNREAD$3"); fi
   gh issue edit "$1" -R "$REPO" "${args[@]}" >/dev/null
 }
 
@@ -401,24 +412,17 @@ thread_message() {
     norm(\$cfg[0].labels) + {activity: \$thread.activity}"
 }
 
-publish_unread() {
-  local message=$1 n unread marked
-  n=$(jq -er .number <<<"$message") || return 1
-  unread=$(jq -r --arg n "$n" --slurpfile read "$D/read.json" --slurpfile cache "$D/activity.json" \
-    '(($cache[0].versions[$n].activity // []) - ($read[0][$n] // []) | length) > 0' <<<"$message") || return 1
-  marked=$(jq -r --arg me "$ME" '.unread | index($me) != null' <<<"$message") || return 1
-  if [ "$unread" != "$marked" ]; then
-    if [ "$unread" = true ]; then
-      ensure_unread_label "$ME" || return 1
-      gh issue edit "$n" -R "$REPO" --add-label "$P_UNREAD$ME" >/dev/null || return 1
-    else
-      gh issue edit "$n" -R "$REPO" --remove-label "$P_UNREAD$ME" >/dev/null || return 1
-    fi
-  fi
-  jq -c --arg n "$n" --arg me "$ME" --argjson unread "$unread" '
-    if .versions[$n] != null then .versions[$n].message.unread |=
-      ((. - [$me]) + if $unread then [$me] else [] end) else . end' "$D/activity.json" |
-    state_write "$D/activity.json"
+# lower_unread <message>: show's last step. Lowers your own flag only when the refetched thread holds no
+# other-party activity missing from your receipts, so anything that landed while you read stays unread.
+lower_unread() {
+  local n
+  n=$(jq -er .number <<<"$1") || return 1
+  jq -e --arg n "$n" --arg me "$ME" --slurpfile read "$D/read.json" --slurpfile cache "$D/activity.json" \
+    '(.unread | index($me)) != null and
+     (($cache[0].versions[$n].activity // .activity) - ($read[0][$n] // []) | length) == 0' <<<"$1" >/dev/null || return 0
+  gh issue edit "$n" -R "$REPO" --remove-label "$P_UNREAD$ME" >/dev/null || return 1
+  jq -c --arg n "$n" --arg me "$ME" 'if .versions[$n] != null then .versions[$n].message.unread -= [$me] else . end' \
+    "$D/activity.json" | state_write "$D/activity.json"
 }
 
 state_lock() {
@@ -458,41 +462,24 @@ cache_thread() {
 }
 
 reconcile_updates() {
-  local n changed source thread candidates prefetched
+  local n source thread candidates prefetched
   jq -c --arg me "$ME" --slurpfile issues <(printf '%s\n' "$1") "$JQ_NORM
     reduce \$issues[0][] as \$issue (.; (\$issue.number | tostring) as \$key |
       .versions[\$key].version as \$known |
       if (\$issue | party(\$me) | not) and (\$issue | newer(\$known)) then
         del(.versions[\$key]) else . end)" "$D/activity.json" | state_write "$D/activity.json"
-  candidates=$(jq -r --arg me "$ME" --slurpfile old "$D/activity.json" --slurpfile read "$D/read.json" "$JQ_NORM
-    .[] | (.number | tostring) as \$key | \$old[0].versions[\$key] as \$known |
-    ((\$known.activity // []) - (\$read[0][\$key] // []) | length > 0) as \$unread |
-    (party(\$me) and newer(\$known.version)) as \$changed |
-    select(\$changed or ((.unread | index(\$me) != null) != \$unread)) |
-    [.number, \$changed] | @tsv" <<<"$1") || return 1
-  # Changed threads are read in batches; unchanged ones cost no detail request at all.
-  # shellcheck disable=SC2046 # issue numbers, no spaces
-  prefetched=$(fetch_threads $(awk -F'\t' '$2 == "true" {print $1}' <<<"$candidates")) || return 1
-  while IFS=$'\t' read -r n changed; do
-    [ -n "$n" ] || continue
+  candidates=$(jq -r --arg me "$ME" --slurpfile old "$D/activity.json" "$JQ_NORM
+    .[] | select(party(\$me) and newer(\$old[0].versions[.number | tostring].version)) | .number" <<<"$1") || return 1
+  # Changed threads are read in batches; unchanged ones cost no detail request at all. Sync never writes labels.
+  # shellcheck disable=SC2086 # issue numbers, no spaces
+  prefetched=$(fetch_threads $candidates) || return 1
+  for n in $candidates; do
     source=$(jq -c --argjson n "$n" '.[] | select(.number == $n)' <<<"$1") || return 1
-    if [ "$changed" = true ]; then
-      # A batched thread older than the list read is stale: fetch_thread retries it and checks its timeline.
-      thread=$({ jq -ce --arg n "$n" --arg u "$(jq -r .updatedAt <<<"$source")" '.[$n] | select(. != null and .updatedAt >= $u)' \
-        <<<"$prefetched" || fetch_thread "$n"; } | thread_message) || return 1
-      printf '%s\n' "$thread" | cache_thread "$source" || return 1
-      publish_unread "$thread" || return 1
-    else
-      publish_unread "$source" || return 1
-    fi
-  done <<<"$candidates"
-  candidates=$(jq -c --arg me "$ME" --slurpfile read "$D/read.json" '
-    .versions[]? | select(((.activity - ($read[0][.message.number | tostring] // []) | length) > 0) !=
-      (.message.unread | index($me) != null)) | .message' "$D/activity.json") || return 1
-  while IFS= read -r source; do
-    [ -n "$source" ] || continue
-    publish_unread "$source" || return 1
-  done <<<"$candidates"
+    # A batched thread older than the list read is stale: fetch_thread retries it and checks its timeline.
+    thread=$({ jq -ce --arg n "$n" --arg u "$(jq -r .updatedAt <<<"$source")" '.[$n] | select(. != null and .updatedAt >= $u)' \
+      <<<"$prefetched" || fetch_thread "$n"; } | thread_message) || return 1
+    printf '%s\n' "$thread" | cache_thread "$source" || return 1
+  done
   jq -c --slurpfile issues <(printf '%s\n' "$1") \
     '.cursor = ([.cursor // empty, $issues[0][].updatedAt] | max)' "$D/activity.json" |
     state_write "$D/activity.json"
@@ -609,8 +596,10 @@ cmd_send() {
   parts+=("<!-- parley-message {\"v\":1,\"from\":\"$ME\",\"to\":\"$F_to\"} -->")
   for p in "${parts[@]}"; do msg+="${msg:+$'\n\n'}$p"; done
 
+  local flag=()
+  if [ "$F_to" != "$ME" ]; then ensure_unread_label "$F_to"; flag=(--label "$P_UNREAD$F_to"); fi
   url=$(gh issue create -R "$REPO" --title "$F_subject" --body "$msg" \
-    --label "$P_TO$F_to" --label "$P_FROM$ME" --label "$(status_label open)")
+    --label "$P_TO$F_to" --label "$P_FROM$ME" --label "$(status_label open)" ${flag[@]+"${flag[@]}"})
   if [ -n "$F_json" ]; then
     jq -nc --argjson n "${url##*/}" --arg u "$url" --arg t "$F_to" '{number: $n, to: $t, url: $u}'
   else
@@ -627,7 +616,8 @@ cmd_list() {
     state_lock
     out=$(jq -c --arg me "$ME" --arg sent "$F_sent" --slurpfile read "$D/read.json" "$JQ_NORM"'
       [.versions[]? | . as $thread | .message | select(party($me)) |
-        .unread = ((.unread - [$me]) + if ($thread.activity - ($read[0][.number | tostring] // []) | length) > 0 then [$me] else [] end) |
+        .unread |= if index($me) == null and ($thread.activity - ($read[0][$thread.message.number | tostring] // []) | length) > 0
+          then . + [$me] else . end |
         select(.unread | index($me)) | select($sent == "" or .from == $me)] |
       sort_by(.updatedAt, .number) | reverse' "$D/activity.json")
   else
@@ -675,20 +665,26 @@ cmd_show() {
     '.[$n] = ((.[$n] // []) + $seen[0] | unique)' "$D/read.json" | state_write "$D/read.json"
   out=$(fetch_thread "$n" | thread_message) || return 1
   printf '%s\n' "$out" | cache_thread "$out"
-  publish_unread "$out"
+  lower_unread "$out"
 
 }
 
 cmd_reply() {
   parse reply "" "$@"
   [ ${#POS[@]} -ge 2 ] || die "usage: parley-axi reply <n> <text>|-"
-  local n=${POS[0]} text="${POS[*]:1}"
+  local n=${POS[0]} text="${POS[*]:1}" other
   resolve
   load "$n"
   need_party "$n"
   if [ "$text" = - ]; then text=$(cat); fi
   [ -n "$text" ] || die "reply text is empty"
   gh issue comment "$n" -R "$REPO" --body "$text" >/dev/null
+  # The flag goes up after the comment, so a reader who lowers it has already seen the comment.
+  other=$(other_party)
+  if [ -n "$other" ]; then
+    { ensure_unread_label "$other" && gh issue edit "$n" -R "$REPO" --add-label "$P_UNREAD$other" >/dev/null; } ||
+      die "replied on #$n, but raising $P_UNREAD$other failed: add it by hand so $other sees the reply"
+  fi
   echo "replied on #$n"
 }
 
@@ -717,7 +713,7 @@ transition() {
     done:OPEN|declined:OPEN) out=$(gh issue close "$n" -R "$REPO" 2>&1) || die "gh failed closing #$n: $out" ;;
     open:CLOSED) out=$(gh issue reopen "$n" -R "$REPO" 2>&1) || die "gh failed reopening #$n: $out" ;;
   esac
-  set_status "$n" "$(status_label "$next")"
+  set_status "$n" "$(status_label "$next")" "$(other_party)"
   echo "#$n $cur -> $next"
 }
 

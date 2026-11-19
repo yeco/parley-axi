@@ -1,7 +1,7 @@
-"""CLI regressions: unread ownership and scheduler safety from the agreed design.
+"""CLI regressions: the unread mailbox flag and scheduler safety from the agreed design.
 
 The independent oracle is the author's narrowed unread/scheduling contract. These cases
-reject edit-only notifications, unretried older read labels, writer-dependent delivery,
+reject edit-only notifications, flags lowered over unseen activity, writer-dependent delivery,
 self-wakes, lost post-print activity, cron
 replacement on read failure, and cadence-only checks with a wrong executable.
 """
@@ -151,10 +151,17 @@ with tempfile.TemporaryDirectory(prefix="parley-review-") as tmp:
         other = "bob" if member == "alice" else "alice"
         assert unread(member) == []
         assert unread(other) == [1]
-    print("ok all transition callers publish activity without setting reader markers")
+    print("ok every transition raises only the other party's flag")
+
+    def flag(member="alice"):
+        mutate(lambda d: d["labels"].append({"name": "unread:" + member}), advance=False)
+
+    def labels():
+        return [label["name"] for label in json.loads(file.read_text())["labels"]]
 
     for actor, expected in (("bob-gh", [1]), ("alice-gh", [])):
         fixture()
+        flag()
         assert unread() == [1]
         printed = call("show", "1", extra={"STUB_READ_RACE": "1", "STUB_RACE_ACTOR": actor})
         assert "A concurrent update" not in printed
@@ -176,7 +183,7 @@ with tempfile.TemporaryDirectory(prefix="parley-review-") as tmp:
     result.stdout.close()
     assert result.wait() != 0
     assert (tmp / "state/parley-axi/team/alice/acme:team/read.json").read_bytes() == before
-    print("ok concurrent incoming activity survives; concurrent own activity stays read")
+    print("ok activity racing the flag's removal stays unread from receipts; own activity stays read")
 
     for sender in ("alice", "bob"):
         for mode in ((), ("--json",)):
@@ -211,7 +218,7 @@ with tempfile.TemporaryDirectory(prefix="parley-review-") as tmp:
         assert int((stub / "timeline-count").read_text()) == 2
         assert {name: (state_dir / name).read_bytes() for name in before} == before
         assert [item["number"] for item in json.loads(call("list", "--unread", "--json"))] == [1]
-        assert "unread:alice" in [label["name"] for label in json.loads(file.read_text())["labels"]]
+        assert "unread:alice" not in labels()  # sync never raises your own flag
         call("show", "1", *mode)
         assert unread() == []
     for mode in ((), ("--json",)):
@@ -260,25 +267,28 @@ with tempfile.TemporaryDirectory(prefix="parley-review-") as tmp:
 
     for mode in ((), ("--json",)):
         fixture()
+        flag()
         assert unread() == [1]
         displayed = call("show", "1", *mode, extra={"STUB_EDIT_FAIL": "1"}, ok=False)
         assert "Old body" in displayed
-        assert [item["number"] for item in json.loads(call("list", "--unread", "--json"))] == []
-        assert "unread:alice" in [label["name"] for label in json.loads(file.read_text())["labels"]]
+        assert [item["number"] for item in json.loads(call("list", "--unread", "--json"))] == [1]
+        assert "unread:alice" in labels()
         Path(env["STUB_LOG"]).write_text("")
         call("sync", "--json")
-        assert "unread:alice" not in [label["name"] for label in json.loads(file.read_text())["labels"]]
-        assert not any(line.startswith("api graphql") for line in Path(env["STUB_LOG"]).read_text().splitlines())
+        assert "unread:alice" in labels()
+        assert not any(line.startswith(("issue edit", "api graphql"))
+                       for line in Path(env["STUB_LOG"]).read_text().splitlines())
+        call("show", "1", *mode)
+        assert "unread:alice" not in labels()
+        assert unread() == []
     fixture()
-    call("sync", "--json", extra={"STUB_EDIT_FAIL": "1"}, ok=False)
+    call("sync", "--json", extra={"STUB_EDIT_FAIL": "1"})
     assert [item["number"] for item in json.loads(call("list", "--unread", "--json"))] == [1]
-    Path(env["STUB_LOG"]).write_text("")
-    assert [(item["number"], item["event"]) for item in json.loads(call("sync", "--json"))] == [(1, "new")]
-    assert not any(line.startswith("api graphql") for line in Path(env["STUB_LOG"]).read_text().splitlines())
-    print("ok receipts control cached unread despite failed projection; sync retries publication without history scans")
+    print("ok a failed lowering keeps the flag up until the next show; sync never edits labels")
 
     for mode in ((), ("--json",)):
         fixture()
+        flag()
         call("sync", "--json")
         older = json.loads(file.read_text())
         newer = {**older, "id": "newer-thread", "number": 2, "title": "Newer request", "url": "https://x/2",
@@ -292,26 +302,17 @@ with tempfile.TemporaryDirectory(prefix="parley-review-") as tmp:
         (stub / "acme__team.issues.json").write_text(json.dumps(listing))
         call("sync", "--json")
         call("show", "2")
-        for name in ("activity", "state"):
-            state = json.loads((tmp / f"state/parley-axi/team/alice/acme:team/{name}.json").read_text())
-            assert state["cursor"] == "2026-11-05T12:00:00Z"
-        call("show", "1", *mode, extra={"STUB_EDIT_FAIL": "1"}, ok=False)
-        assert json.loads(call("list", "--unread", "--json")) == []
-        assert "unread:alice" in [label["name"] for label in json.loads(file.read_text())["labels"]]
-        Path(env["STUB_LOG"]).write_text("")
-        assert json.loads(call("sync", "--json")) == []
-        assert "unread:alice" not in [label["name"] for label in json.loads(file.read_text())["labels"]]
+        call("show", "1", *mode)
+        assert "unread:alice" not in labels()
         cache = json.loads((tmp / "state/parley-axi/team/alice/acme:team/activity.json").read_text())
         assert "alice" not in cache["versions"]["1"]["message"]["unread"]
-        requests = Path(env["STUB_LOG"]).read_text().splitlines()
-        assert sum(line.startswith("api --paginate repos/acme/team/issues?") for line in requests) == 1
-        assert not any(line.startswith("api graphql") or line.startswith("issue view") for line in requests)
         Path(env["STUB_LOG"]).write_text("")
-        call("sync", "--json")
-        assert not any(line.startswith("issue edit") or line.startswith("api graphql")
+        assert json.loads(call("sync", "--json")) == []
+        assert json.loads(call("list", "--unread", "--json")) == []
+        assert not any(line.startswith(("issue edit", "api graphql", "issue view"))
                        for line in Path(env["STUB_LOG"]).read_text().splitlines())
     (stub / "acme__team.issue-2.json").unlink()
-    print("ok successful sync retries older cached read-label failures outside overlap once, without history scans")
+    print("ok show lowers a flag on a thread older than the overlap window; the next sync stays quiet")
 
     fixture()
     call("sync", "--json")
@@ -359,8 +360,9 @@ with tempfile.TemporaryDirectory(prefix="parley-review-") as tmp:
         mutate(lambda d: d.update(labels=[{"name": prefix + "carol"} if label["name"].startswith(prefix) else label
                                          for label in d["labels"]]), advance=False)
         assert unread() == []
+        Path(env["STUB_LOG"]).write_text("")
         call("show", "1", ok=False)
-        assert "unread:alice" not in [label["name"] for label in json.loads(file.read_text())["labels"]]
+        assert not any(line.startswith("issue edit") for line in Path(env["STUB_LOG"]).read_text().splitlines())
         result = subprocess.run(["bash", str(ROOT / "checks/parley.check.sh")], env=env,
                                 text=True, capture_output=True, check=True)
         assert result.stdout == ""
